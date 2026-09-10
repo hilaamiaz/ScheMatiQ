@@ -1634,7 +1634,7 @@ class PaperProcessor:
             messages, truncate=True, max_new=task_tokens, context_window_size=max_ctx
         )
 
-        raw_response = self.llm.generate(
+        raw_response = self._generate(
             trimmed, max_output_tokens=task_tokens, **self._gemini_kwargs(thinking_budget=1024)
         )
 
@@ -2070,6 +2070,13 @@ class PaperProcessor:
         if not observation_unit:
             raise ValueError("observation_unit required in schema for value extraction")
 
+        # Load this document's figure images before identification too — a unit
+        # whose only textual footprint is a figure/caption (e.g. something only
+        # labeled in a diagram) would otherwise never be found, since
+        # identify_observation_units searches paper_text alone. Per-unit
+        # extraction calls below reuse this same load via _generate().
+        self._load_document_figures(figures_dir)
+
         if known_units is not None:
             if not known_units:
                 print(f"  ⚠️ No known units listed for {paper_title}, skipping document")
@@ -2111,10 +2118,6 @@ class PaperProcessor:
         cache_system_prompt = SYSTEM_PROMPT_VAL_WITH_UNIT.format(unit_name=observation_unit.name)
         self._active_context_cache = self._create_document_cache(cache_system_prompt, paper_text)
 
-        # Load this document's figure images once (I/O happens here only); every
-        # per-unit call below attaches them via _generate() so an image and the
-        # <REQUESTED_COLUMNS> it might answer always travel together.
-        self._load_document_figures(figures_dir)
         if self._active_context_cache:
             print(f"  📦 Created context cache for {paper_title}")
         if self._active_figure_images:

@@ -786,6 +786,11 @@ class GeminiLLM(LLMInterface):
         """
         if not images:
             return prompt_text
+        logger.info(
+            "Gemini call with %d image(s), total %d bytes",
+            len(images),
+            sum(len(b) for _, b, _ in images),
+        )
         parts: List[Any] = [prompt_text]
         for label, image_bytes, mime_type in images:
             if label:
