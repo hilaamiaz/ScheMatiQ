@@ -506,6 +506,11 @@ export interface AddColumnRequest {
   rationale?: string;
   document_paths?: string[]; // Specific documents to process
   allowed_values?: string[]; // Closed set of valid values
+  data_type?: string; // Backend defaults to "text" when omitted
+  // Insert index for the recreated column; omit to append (the default for
+  // every caller except delete-column undo, which restores the column to
+  // its original position).
+  position?: number;
   llm_config?: {
     provider: string;
     model: string;

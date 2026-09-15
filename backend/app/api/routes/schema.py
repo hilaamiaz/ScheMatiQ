@@ -52,6 +52,11 @@ class ColumnAddRequest(BaseModel):
     documents_path: Optional[str] = None
     data_type: str = "text"
     llm_config: Optional[Dict[str, Any]] = None  # User-provided LLM config with API key
+    # Insert index for the recreated column; None means append (today's
+    # behavior for the manual "Add column" dialog and the spare-row
+    # auto-create flow). Only the delete-column undo path sets this, so a
+    # deleted column reappears where it originally was instead of at the end.
+    position: Optional[int] = None
 
 class ColumnMergeRequest(BaseModel):
     source_columns: List[str]
@@ -326,7 +331,11 @@ async def add_column(
             allowed_values=add_request.allowed_values if add_request.allowed_values else None
         )
         
-        session.columns.append(new_column)
+        if add_request.position is not None:
+            insert_at = max(0, min(add_request.position, len(session.columns)))
+            session.columns.insert(insert_at, new_column)
+        else:
+            session.columns.append(new_column)
 
         # Track modification in history
         modification = ModificationAction(
@@ -353,7 +362,14 @@ async def add_column(
                 unique_count=0,
                 allowed_values=add_request.allowed_values if add_request.allowed_values else None
             )
-            session.statistics.column_stats.append(new_col_info)
+            if add_request.position is not None:
+                # column_stats is a separate list and not guaranteed to stay
+                # the same length as session.columns, so clamp against its
+                # own length rather than reusing insert_at.
+                stats_insert_at = max(0, min(add_request.position, len(session.statistics.column_stats)))
+                session.statistics.column_stats.insert(stats_insert_at, new_col_info)
+            else:
+                session.statistics.column_stats.append(new_col_info)
             session.statistics.total_columns = len(session.columns)
 
             # Update schema_evolution
