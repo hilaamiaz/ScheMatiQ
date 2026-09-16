@@ -1524,6 +1524,12 @@ export function SpreadsheetSurface({
               // list state at the moment that insert happens (deleting columns
               // at indices 1 and 3, then restoring 1 before 3, reproduces the
               // original order -- restoring 3 before 1 would not).
+              // This reproduces the original order only when the schema hasn't
+              // changed since the delete: `originalIndex` was captured then
+              // and is not re-validated here, so an add/remove elsewhere in
+              // the meantime makes it stale -- the restored column can land in
+              // a different (but always valid; the route clamps out-of-range
+              // positions) slot than it started in.
               const ordered = [...snapshot].sort((a, b) => a.originalIndex - b.originalIndex);
               const failedNames: string[] = [];
               for (const { col, originalIndex } of ordered) {
@@ -1535,6 +1541,11 @@ export function SpreadsheetSurface({
                     allowed_values: col.allowed_values,
                     data_type: col.data_type,
                     position: originalIndex >= 0 ? originalIndex : undefined,
+                    // col.name is already canonical, so the backend's normal
+                    // derive-from-name would always yield display_name=None,
+                    // dropping the column's original user-typed label -- pass
+                    // it through explicitly instead.
+                    display_name: col.display_name,
                   });
                 } catch {
                   failedNames.push(col.name);

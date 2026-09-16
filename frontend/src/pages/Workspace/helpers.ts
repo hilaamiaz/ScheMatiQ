@@ -383,8 +383,15 @@ export function diffPaginatedData(
       // restore it verbatim via restoreCell instead of updateCell -- neither
       // direction of a reextraction undo is a manual edit, so the backend
       // should not stamp manually_edited on either one (see applyCellUpdates).
-      updates.push({ rowName, sourceDocument, rowIndexId, column, value: afterValue, raw: afterRaw });
-      inverseUpdates.push({ rowName, sourceDocument, rowIndexId, column, value: beforeValue, raw: beforeRaw });
+      // Coerce a genuinely absent cell (undefined -- the column had no value
+      // at all before/after) to null rather than leaving it undefined:
+      // applyCellUpdates routes on `raw !== undefined` to pick restoreCell
+      // over updateCell, and undefined would fall through to updateCell,
+      // wrongly stamping manually_edited on a value nobody typed.
+      updates.push({ rowName, sourceDocument, rowIndexId, column, value: afterValue, raw: afterRaw ?? null });
+      inverseUpdates.push({
+        rowName, sourceDocument, rowIndexId, column, value: beforeValue, raw: beforeRaw ?? null,
+      });
     });
   });
 

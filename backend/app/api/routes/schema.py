@@ -57,6 +57,13 @@ class ColumnAddRequest(BaseModel):
     # auto-create flow). Only the delete-column undo path sets this, so a
     # deleted column reappears where it originally was instead of at the end.
     position: Optional[int] = None
+    # Explicit display label for the recreated column; None means derive it
+    # normally from `name` (today's behavior for the manual "Add column"
+    # dialog and the spare-row auto-create flow). Only the delete-column undo
+    # path sets this -- `name` there is already the canonical key, so
+    # re-deriving would always yield None and drop the column's original
+    # user-typed label.
+    display_name: Optional[str] = None
 
 class ColumnMergeRequest(BaseModel):
     source_columns: List[str]
@@ -310,11 +317,17 @@ async def add_column(
             raise HTTPException(status_code=404, detail="Session not found")
 
         # Sanitize the user-typed name into a canonical key; keep the original
-        # text as a display label only when it differs.
+        # text as a display label only when it differs. The delete-column undo
+        # path passes an already-canonical `name` (so derivation would always
+        # yield None) plus the column's original `display_name` explicitly --
+        # honor that when given, otherwise fall back to normal derivation.
         from app.services.data_utils import canonicalize_column_name
-        canonical_name, display_name = canonicalize_column_name(add_request.name)
+        canonical_name, derived_display_name = canonicalize_column_name(add_request.name)
         if not canonical_name:
             raise HTTPException(status_code=400, detail="Column name cannot be empty")
+        display_name = (
+            add_request.display_name if add_request.display_name is not None else derived_display_name
+        )
 
         # Check if column already exists (compare on the canonical key)
         for col in session.columns:

@@ -1,9 +1,13 @@
-"""Tests for POST /schema/add-column/{session_id}'s optional `position` field.
+"""Tests for POST /schema/add-column/{session_id}'s optional `position` and
+`display_name` fields.
 
-The endpoint always appended a recreated column to the end of the schema.
-Delete-column undo (frontend/src/pages/Workspace/SpreadsheetSurface.tsx)
-needs it to insert at a specific index instead, so an undone delete restores
-the column to where it originally was. Route handler is called directly with
+The endpoint always appended a recreated column to the end of the schema and
+derived its display label from `name`. Delete-column undo (frontend/src/
+pages/Workspace/SpreadsheetSurface.tsx) needs `position` to insert at a
+specific index instead, so an undone delete restores the column to where it
+originally was -- and needs `display_name` because the `name` it passes is
+already canonical, so derivation would always yield None and drop the
+column's original user-typed label. Route handler is called directly with
 session_manager/websocket_manager faked, matching
 test_chat_messages_endpoint.py.
 """
@@ -68,6 +72,14 @@ def _stats_names(sess: VisualizationSession) -> list[str]:
     return [c.name for c in sess.statistics.column_stats]
 
 
+def _display_names(sess: VisualizationSession) -> list[str | None]:
+    return [c.display_name for c in sess.columns]
+
+
+def _stats_display_names(sess: VisualizationSession) -> list[str | None]:
+    return [c.display_name for c in sess.statistics.column_stats]
+
+
 @pytest.mark.asyncio
 async def test_no_position_still_appends(session):
     """Regression guard: the manual "Add column" dialog and the spare-row
@@ -115,3 +127,45 @@ async def test_duplicate_name_still_rejected_regardless_of_position(session):
         )
     assert exc.value.status_code == 400
     assert _names(session) == ["A", "B", "C"]
+
+
+@pytest.mark.asyncio
+async def test_no_display_name_still_derives_from_name(session):
+    """Regression guard: every caller except delete-column undo (the manual
+    "Add column" dialog, the spare-row auto-create flow) never sends
+    display_name and must keep deriving it from the typed name."""
+    await schema_routes.add_column(
+        SESSION_ID, schema_routes.ColumnAddRequest(name="Case Name", definition="d"),
+    )
+    # "Case Name" sanitizes to "Case_Name", which differs from the raw text,
+    # so canonicalize_column_name derives a real display label.
+    assert _names(session) == ["A", "B", "C", "Case_Name"]
+    assert _display_names(session) == [None, None, None, "Case Name"]
+    assert _stats_display_names(session) == [None, None, None, "Case Name"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_display_name_is_honored_over_derivation(session):
+    """The bug this guards: delete-column undo passes `name` already
+    canonical (col.name), so re-deriving display_name from it would always
+    yield None and drop the column's original user-typed label. Passing
+    display_name explicitly must override that derivation."""
+    await schema_routes.add_column(
+        SESSION_ID,
+        schema_routes.ColumnAddRequest(name="Case_Name", definition="d", display_name="Case Name"),
+    )
+    assert _names(session) == ["A", "B", "C", "Case_Name"]
+    assert _display_names(session) == [None, None, None, "Case Name"]
+    assert _stats_display_names(session) == [None, None, None, "Case Name"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_display_name_none_falls_back_to_derivation(session):
+    """A restored column that never had a distinct display_name (col.name was
+    always canonical) sends display_name=None explicitly -- must behave
+    exactly like the field being omitted, not like an empty label."""
+    await schema_routes.add_column(
+        SESSION_ID,
+        schema_routes.ColumnAddRequest(name="Case Name", definition="d", display_name=None),
+    )
+    assert _display_names(session) == [None, None, None, "Case Name"]

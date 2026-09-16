@@ -511,6 +511,11 @@ export interface AddColumnRequest {
   // every caller except delete-column undo, which restores the column to
   // its original position).
   position?: number;
+  // Explicit display label for the recreated column; omit to derive it
+  // normally from `name` (the default for every caller except delete-column
+  // undo, which passes the column's original display_name since `name` there
+  // is already canonical and would derive to none).
+  display_name?: string;
   llm_config?: {
     provider: string;
     model: string;
