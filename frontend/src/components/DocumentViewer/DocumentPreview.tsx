@@ -303,6 +303,24 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
         </div>
       );
     }
+    if (figureImageUrl) {
+      // Dedicated <img> render, not the generic iframe path below: an
+      // <iframe src="...png"> resolves to the browser's own bare
+      // image-document rendering, which gets none of this app's
+      // sizing/centering and can end up oversized/mispositioned inside the
+      // panel's constrained box -- reading as blank. A plain <img>, the
+      // same approach already proven working in ContentModal's popup,
+      // avoids that entirely.
+      return (
+        <div className="h-full w-full flex items-center justify-center overflow-auto p-2">
+          <img
+            src={contentUrl as string}
+            alt={figureCaption || 'Figure'}
+            className="max-w-full max-h-full object-contain"
+          />
+        </div>
+      );
+    }
     if (useInlineText && !contentIsBinary) {
       return renderInlineText();
     }

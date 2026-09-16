@@ -1358,6 +1358,7 @@ function Workspace() {
         onSelectionChange={updateSheetSelection}
         onGroundingHighlight={handleGroundingHighlight}
         onFigureGrounding={handleFigureGrounding}
+        onRequestSourcePanel={() => setShowSourcePanel(true)}
         onGroundingScrollRequest={() => setGroundingScrollNonce((n) => n + 1)}
         onRefresh={() => refresh({ silent: true })}
         onSchemaRefresh={refreshSchemaOnly}

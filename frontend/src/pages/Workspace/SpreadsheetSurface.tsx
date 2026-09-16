@@ -81,6 +81,7 @@ export function SpreadsheetSurface({
   onSelectionChange,
   onGroundingHighlight,
   onFigureGrounding,
+  onRequestSourcePanel,
   onGroundingScrollRequest,
   onRefresh,
   onSchemaRefresh,
@@ -124,6 +125,10 @@ export function SpreadsheetSurface({
   // switch to showing that figure image instead of the source document.
   // Fires alongside onGroundingHighlight from the same selection handler.
   onFigureGrounding?: (figure: FigureExcerpt | null) => void;
+  // Fires when the indicator on a figure-cited cell is clicked, so the
+  // source panel opens (if not already) instead of the grounding popup --
+  // the figure shows in the panel via onFigureGrounding above, not a popup.
+  onRequestSourcePanel?: () => void;
   // Fires on each mouse click of a grounded data cell, so the source panel can
   // re-scroll to the highlight even when the same cell is clicked again.
   onGroundingScrollRequest?: () => void;
@@ -2033,6 +2038,15 @@ export function SpreadsheetSurface({
           if (!inIndicatorRegion) return;
 
           const grounding = dataGrounding[physicalRow][column.key];
+          const figureExcerpt = grounding.excerpts.find((e) => e.type === 'figure');
+          if (figureExcerpt) {
+            // No popup for a figure citation -- afterSelectionEnd already
+            // set selectedFigure via onFigureGrounding (selection fires
+            // before this mousedown check), so just make sure the panel
+            // that shows it is open.
+            onRequestSourcePanel?.();
+            return;
+          }
           setGroundingModal({
             title: `${columnDisplayLabel(column.key)} — grounding`,
             content: { answer: grounding.answer, excerpts: grounding.excerpts },
