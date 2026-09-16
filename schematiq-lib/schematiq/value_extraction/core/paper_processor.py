@@ -559,13 +559,64 @@ class PaperProcessor:
                 "⚠️  on_value_extracted callback is NOT SET - cell streaming disabled"
             )
 
+    def _match_excerpt_to_figure_caption(self, excerpt_text: str) -> Optional[str]:
+        """Return the figure_id whose caption this text excerpt fuzzy-matches, or None.
+
+        Catches the common case where the model quotes a figure's caption
+        back as a normal text excerpt instead of citing it via figure_refs
+        (observed in practice: the model quoted "...POE production..." for
+        an answer whose figure caption actually reads "...PGE
+        production..." — a text-layer artifact, not a paraphrase, so exact
+        matching alone would miss it). Reuses self.excerpt_grounder's
+        exact -> case-insensitive -> fuzzy-sliding-window matching (same
+        0.6 threshold already established for grounding decisions
+        elsewhere), called with whichever of {excerpt, caption} is longer
+        as the "source text" being searched within — a caption can span
+        multiple sub-panels ("a, ... b, ...") and be much longer than the
+        quoted fragment.
+
+        Both strings are whitespace-normalized (collapsed to single spaces)
+        before matching. Verified against a real extracted caption: Docling
+        renders captions with stray double-spaces (PDF justification
+        artifacts, e.g. "Fig.  1 a, Stimulation  by  SEM...") that the model
+        doesn't reproduce when quoting them back. ground_excerpt's fuzzy
+        phase re-verifies its own word-level match with `" ".join(...)`
+        (single-spaced) against the *original* (unnormalized) source_text —
+        so without this normalization, a real caption's double-spaces make
+        that re-verification's `.find()` fail and the whole match silently
+        reports "not_found" even though the excerpt and caption agree word
+        for word. Confirmed empirically before writing this.
+        """
+        figures_by_id = getattr(self, "_active_figures_by_id", None) or {}
+        if not figures_by_id:
+            return None
+        norm_excerpt = " ".join(excerpt_text.split())
+        for figure_id, fig in figures_by_id.items():
+            caption = (fig.get("caption") or "").strip()
+            if not caption:
+                continue
+            norm_caption = " ".join(caption.split())
+            short, long_ = (
+                (norm_excerpt, norm_caption)
+                if len(norm_excerpt) <= len(norm_caption)
+                else (norm_caption, norm_excerpt)
+            )
+            _, _, status = self.excerpt_grounder.ground_excerpt(short, long_)
+            if status != "not_found":
+                return figure_id
+        return None
+
     def _attach_source_to_excerpts(
         self, data: Dict[str, Any], source_filename: str
     ) -> Dict[str, Any]:
         """Attach source filename to each excerpt in the extracted data.
 
         Converts plain excerpt strings to objects with source info:
-        {"text": "excerpt text", "source": "filename.txt"}
+        {"text": "excerpt text", "source": "filename.txt"} — unless the
+        excerpt text itself fuzzy-matches one of this call's figure
+        captions (see _match_excerpt_to_figure_caption), in which case it
+        becomes a figure-typed excerpt instead, same as an explicit
+        figure_refs citation.
 
         Also consumes each column's `figure_refs` (a list of figure_id
         strings the model cited, from the response schema — see
@@ -579,20 +630,32 @@ class PaperProcessor:
         grounding. `figure_refs` itself is consumed here and not carried
         into the stored cell (the resulting figure excerpts are the
         durable record).
+
+        Both routes (caption-match and figure_refs) can point at the same
+        figure for one column — deduped to a single entry per figure_id.
         """
         figures_by_id = getattr(self, "_active_figures_by_id", None) or {}
         for col_name, col_value in data.items():
             if not isinstance(col_value, dict) or "excerpts" not in col_value:
                 continue
             excerpts = col_value.get("excerpts", [])
-            col_value["excerpts"] = [
-                (
-                    {"text": exc, "source": source_filename}
-                    if isinstance(exc, str)
-                    else exc
-                )
-                for exc in excerpts
-            ]
+
+            def _wrap(exc):
+                if not isinstance(exc, str):
+                    return exc
+                matched_figure_id = self._match_excerpt_to_figure_caption(exc) if figures_by_id else None
+                if matched_figure_id:
+                    fig = figures_by_id[matched_figure_id]
+                    return {
+                        "type": "figure",
+                        "figure_id": matched_figure_id,
+                        "source": source_filename,
+                        "caption": fig.get("caption"),
+                        "image_filename": fig.get("image_filename"),
+                    }
+                return {"text": exc, "source": source_filename}
+
+            col_value["excerpts"] = [_wrap(exc) for exc in excerpts]
 
             figure_refs = col_value.pop("figure_refs", None) or []
             if figure_refs and figures_by_id:
@@ -607,6 +670,20 @@ class PaperProcessor:
                         "caption": fig.get("caption"),
                         "image_filename": fig.get("image_filename"),
                     })
+
+            # Dedup figure-typed entries by figure_id (caption-match and an
+            # explicit figure_refs citation can independently point at the
+            # same figure); keep text excerpts and first-seen order as-is.
+            seen_figure_ids = set()
+            deduped = []
+            for exc in col_value["excerpts"]:
+                if isinstance(exc, dict) and exc.get("type") == "figure":
+                    fid = exc.get("figure_id")
+                    if fid in seen_figure_ids:
+                        continue
+                    seen_figure_ids.add(fid)
+                deduped.append(exc)
+            col_value["excerpts"] = deduped
         return data
 
     def _should_skip_truncation(self) -> bool:

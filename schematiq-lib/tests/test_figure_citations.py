@@ -28,6 +28,7 @@ import pytest
 from schematiq.value_extraction.core.json_parser import JSONResponseParser
 from schematiq.value_extraction.core.paper_processor import PaperProcessor
 from schematiq.value_extraction.core.row_manager import RowDataManager
+from schematiq.value_extraction.utils.excerpt_grounder import ExcerptGrounder
 from schematiq.value_extraction.utils.schema_builder import build_extraction_response_schema
 
 
@@ -139,6 +140,13 @@ class TestPostprocessCarriesFigureRefs:
 def _make_self(figures_by_id=None):
     s = MagicMock()
     s._active_figures_by_id = figures_by_id or {}
+    # _attach_source_to_excerpts now calls self._match_excerpt_to_figure_caption
+    # and self.excerpt_grounder internally -- a bare MagicMock attribute for
+    # either would return a truthy Mock instead of running the real caption
+    # matching, so every plain-text excerpt would spuriously "match" and
+    # KeyError. Wire the real bound method + a real grounder onto the mock.
+    s.excerpt_grounder = ExcerptGrounder()
+    s._match_excerpt_to_figure_caption = lambda text: PaperProcessor._match_excerpt_to_figure_caption(s, text)
     return s
 
 
@@ -228,6 +236,135 @@ class TestAttachSourceToExcerptsFigureHandling:
         assert excerpts[0] == {"text": "We propose Mamba...", "source": "paper1.pdf"}
         assert excerpts[1]["type"] == "figure"
         assert excerpts[1]["figure_id"] == "paper1_fig003"
+
+
+# ---------------------------------------------------------------------------
+# 3b. _match_excerpt_to_figure_caption: catch the model quoting a caption as
+# a plain text excerpt instead of using figure_refs (the actual failure mode
+# observed against a real session — see class docstring).
+# ---------------------------------------------------------------------------
+
+# A real caption pulled from a live session's manifest.json (Docling extraction
+# of a real paper). Deliberately kept verbatim, including its double-space
+# PDF-justification artifacts ("Fig.  1 a,", "Stimulation  by  SEM") — this
+# whitespace irregularity is exactly what broke the naive first version of
+# this matcher (confirmed empirically before writing this test): the model's
+# quoted excerpt uses normal single spacing, so without normalizing both
+# strings before comparing, ground_excerpt's own re-verification step
+# (`source_text.find(single_spaced_match)` against the *original*
+# double-spaced caption) silently failed and reported "not_found" even
+# though the words matched exactly.
+REAL_CAPTION_WITH_DOUBLE_SPACES = (
+    "Fig.  1 a, Stimulation  by  SEM of POE production  by  chondrocytes. "
+    "The results represent the mean ± standard error of determinations "
+    "in quadruplicate wells. b, Stimulation  by  SEM  of  production  of  "
+    "plasminogen  activator  by  human  articular chondrocytes."
+)
+REAL_MODEL_QUOTED_EXCERPT = "Fig. 1 a, Stimulation by SEM of POE production by chondrocytes."
+
+
+class TestMatchExcerptToFigureCaption:
+    def test_real_observed_case_matches_despite_caption_double_spacing(self):
+        # This is the exact case that motivated this feature: without
+        # whitespace normalization, this returns not_found even though the
+        # excerpt is a verbatim (single-spaced) quote of the caption.
+        s = _make_self(figures_by_id={
+            "286888a0_fig004": {"caption": REAL_CAPTION_WITH_DOUBLE_SPACES},
+        })
+
+        figure_id = s._match_excerpt_to_figure_caption(REAL_MODEL_QUOTED_EXCERPT)
+
+        assert figure_id == "286888a0_fig004"
+
+    def test_attach_source_converts_the_real_observed_cell(self):
+        # End-to-end through the public method, matching the actual shape
+        # pulled from a live session's extracted_data.jsonl.
+        s = _make_self(figures_by_id={
+            "286888a0_fig004": {
+                "caption": REAL_CAPTION_WITH_DOUBLE_SPACES,
+                "image_filename": "fig004.png",
+            },
+        })
+        data = {"figure_id": {"answer": "Fig. 1", "excerpts": [REAL_MODEL_QUOTED_EXCERPT]}}
+
+        result = PaperProcessor._attach_source_to_excerpts(s, data, "286888a0")
+
+        excerpts = result["figure_id"]["excerpts"]
+        assert len(excerpts) == 1
+        assert excerpts[0]["type"] == "figure"
+        assert excerpts[0]["figure_id"] == "286888a0_fig004"
+        assert excerpts[0]["image_filename"] == "fig004.png"
+
+    def test_unrelated_excerpt_does_not_match(self):
+        # False-positive guard: a real, substantial excerpt about something
+        # else entirely must not spuriously match an unrelated caption.
+        s = _make_self(figures_by_id={
+            "286888a0_fig004": {"caption": REAL_CAPTION_WITH_DOUBLE_SPACES},
+        })
+
+        figure_id = s._match_excerpt_to_figure_caption(
+            "Patients were recruited from three tertiary care centers between 2019 and 2021.",
+        )
+
+        assert figure_id is None
+
+    def test_short_generic_caption_does_not_match_unrelated_text(self):
+        # The false-positive trade-off flagged in the plan: a short/generic
+        # caption is exactly the risky case. ground_excerpt's own >=3-word
+        # requirement for the fuzzy phase (and no exact/case-insensitive
+        # substring hit) should keep this safe.
+        s = _make_self(figures_by_id={
+            "paper1_fig001": {"caption": "Figure 1: Results."},
+        })
+
+        figure_id = s._match_excerpt_to_figure_caption(
+            "The results of this study demonstrate a significant effect across all cohorts tested.",
+        )
+
+        assert figure_id is None
+
+    def test_matches_the_right_one_of_several_figures(self):
+        s = _make_self(figures_by_id={
+            "paper1_fig001": {"caption": "Fig. 1. Distribution of patient ages across the cohort."},
+            "paper1_fig002": {"caption": REAL_CAPTION_WITH_DOUBLE_SPACES},
+            "paper1_fig003": {"caption": "Fig. 3. Kaplan-Meier survival curve stratified by treatment arm."},
+        })
+
+        figure_id = s._match_excerpt_to_figure_caption(REAL_MODEL_QUOTED_EXCERPT)
+
+        assert figure_id == "paper1_fig002"
+
+    def test_no_figures_attached_returns_none_without_raising(self):
+        s = _make_self(figures_by_id={})
+        assert s._match_excerpt_to_figure_caption(REAL_MODEL_QUOTED_EXCERPT) is None
+
+    def test_figure_with_no_caption_is_skipped_not_raised(self):
+        s = _make_self(figures_by_id={"paper1_fig001": {}})
+        assert s._match_excerpt_to_figure_caption(REAL_MODEL_QUOTED_EXCERPT) is None
+
+    def test_caption_match_and_explicit_figure_refs_for_same_figure_are_deduped(self):
+        # A column could have a text excerpt that caption-matches figure X
+        # *and* an explicit figure_refs citation for the same figure X (the
+        # model half-complying) -- must not produce two entries for it.
+        s = _make_self(figures_by_id={
+            "286888a0_fig004": {
+                "caption": REAL_CAPTION_WITH_DOUBLE_SPACES,
+                "image_filename": "fig004.png",
+            },
+        })
+        data = {
+            "figure_id": {
+                "answer": "Fig. 1",
+                "excerpts": [REAL_MODEL_QUOTED_EXCERPT],
+                "figure_refs": ["286888a0_fig004"],
+            },
+        }
+
+        result = PaperProcessor._attach_source_to_excerpts(s, data, "286888a0")
+
+        excerpts = result["figure_id"]["excerpts"]
+        assert len(excerpts) == 1
+        assert excerpts[0]["figure_id"] == "286888a0_fig004"
 
 
 # ---------------------------------------------------------------------------
