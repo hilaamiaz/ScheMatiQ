@@ -1,11 +1,17 @@
-import type { DataRow } from '@/types';
+import type { DataRow, FigureExcerpt, TextExcerpt } from '@/types';
 
 import { extractDisplayValue, parsePythonString } from './valueUtils';
 
-export type ParsedExcerpt = { text: string; source: string };
+// Wider than just text now — a figure-backed citation (see FigureExcerpt) has
+// no `text` at all, so every consumer of ParsedExcerpt must check
+// `excerpt.type === 'figure'` before assuming `.text` exists.
+export type ParsedExcerpt = TextExcerpt | FigureExcerpt;
 
 /**
  * Parse pipe-separated excerpt strings like: {'text': '...', 'source': '...'} | {'text': '...'}
+ * Figure-typed objects (`{type: 'figure', figure_id, ...}`) are passed through
+ * unchanged — they never arrive as pipe-separated/Python-dict strings (they
+ * have no `text` to encode that way), only as real objects from parsed JSON.
  */
 export function parseExcerpts(excerpts: unknown[]): ParsedExcerpt[] {
   const result: ParsedExcerpt[] = [];
@@ -31,7 +37,15 @@ export function parseExcerpts(excerpts: unknown[]): ParsedExcerpt[] {
       }
     } else if (typeof exc === 'object' && exc !== null) {
       const obj = exc as Record<string, unknown>;
-      if ('text' in obj) {
+      if (obj.type === 'figure' && typeof obj.figure_id === 'string') {
+        result.push({
+          type: 'figure',
+          figure_id: obj.figure_id,
+          source: String(obj.source || `Source ${result.length + 1}`),
+          ...(typeof obj.caption === 'string' ? { caption: obj.caption } : {}),
+          ...(typeof obj.image_filename === 'string' ? { image_filename: obj.image_filename } : {}),
+        });
+      } else if ('text' in obj) {
         result.push({
           text: String(obj.text || ''),
           source: String(obj.source || `Source ${result.length + 1}`),

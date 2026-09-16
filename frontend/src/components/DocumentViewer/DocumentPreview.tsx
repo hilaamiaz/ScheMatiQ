@@ -70,6 +70,16 @@ interface DocumentPreviewProps {
    * document away and clicked the same cell again).
    */
   scrollNonce?: number;
+  /**
+   * When set, short-circuits everything else in this component and just
+   * shows this figure image directly (an <img>, not the iframe/text-highlight
+   * machinery) — used when the selected cell's citation is figure-typed
+   * (FigureExcerpt) rather than pointing at a document to highlight text in.
+   * Takes priority over documentName/sessionId resolution when present.
+   */
+  figureImageUrl?: string;
+  /** Optional caption shown under the figure image / as its header label. */
+  figureCaption?: string;
 }
 
 /**
@@ -99,13 +109,16 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   uploading,
   highlightTexts,
   scrollNonce,
+  figureImageUrl,
+  figureCaption,
 }) => {
   const contentUrl = useMemo(() => {
+    if (figureImageUrl) return figureImageUrl;
     if (!sessionId || !documentName) return null;
     const base = unitsAPI.getDocumentContentUrl(sessionId, documentName);
     // Cache-bust so a freshly uploaded file isn't masked by a cached 404/response.
     return reloadToken ? `${base}&_t=${reloadToken}` : base;
-  }, [sessionId, documentName, reloadToken]);
+  }, [figureImageUrl, sessionId, documentName, reloadToken]);
 
   const [availability, setAvailability] = useState<Availability>('idle');
 
@@ -134,9 +147,15 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   const showOpenFull = Boolean(contentUrl) && availability === 'ok';
 
   // Highlight mode is opt-in (the prop is present) and only applies to text
-  // formats we can render and annotate ourselves.
-  const highlightEnabled = highlightTexts !== undefined;
-  const isTextRenderable = ext === '' || TEXT_EXTENSIONS.has(ext);
+  // formats we can render and annotate ourselves. A figure image is never
+  // text-renderable regardless of what `ext` defaults to with no
+  // documentName (empty ext would otherwise default isTextRenderable to
+  // true and try to fetch document *text* for a null documentName, getting
+  // stuck on a permanent "Loading…" instead of showing the image) — so
+  // figureImageUrl always forces the plain image path, ignoring any
+  // highlightTexts the caller might still be passing from a prior selection.
+  const highlightEnabled = !figureImageUrl && highlightTexts !== undefined;
+  const isTextRenderable = !figureImageUrl && (ext === '' || TEXT_EXTENSIONS.has(ext));
   const useInlineText = highlightEnabled && isTextRenderable;
 
   const [text, setText] = useState<string | null>(null);
@@ -326,8 +345,11 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   return (
     <div className="flex-1 min-w-0 h-full flex flex-col">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border text-xs">
-        <span className="truncate text-muted-foreground" title={documentName || ''}>
-          {documentName || 'No document selected'}
+        <span
+          className="truncate text-muted-foreground"
+          title={figureImageUrl ? (figureCaption || 'Figure') : (documentName || '')}
+        >
+          {figureImageUrl ? (figureCaption || 'Figure') : (documentName || 'No document selected')}
         </span>
         <span className="flex-1" />
         {showOpenFull && (

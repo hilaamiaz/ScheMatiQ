@@ -19,7 +19,7 @@ import ContentModal from '@/components/ContentModal/ContentModal';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 import { observationUnitAPI, schemaAPI, schematiqAPI } from '@/services/api';
-import type { ColumnInfo, DataRow, PaginatedData, SchemaData } from '@/types';
+import type { ColumnInfo, DataRow, FigureExcerpt, PaginatedData, SchemaData } from '@/types';
 import { formatColumnName } from '@/utils/formatting';
 import type { EditCommand } from './hooks/useEditHistory';
 
@@ -80,6 +80,7 @@ export function SpreadsheetSurface({
   searchTermRef,
   onSelectionChange,
   onGroundingHighlight,
+  onFigureGrounding,
   onGroundingScrollRequest,
   onRefresh,
   onSchemaRefresh,
@@ -118,6 +119,11 @@ export function SpreadsheetSurface({
   // Reports all grounding excerpts of the newly selected data cell (or null when
   // the cell has no grounding), so the source panel can highlight them.
   onGroundingHighlight?: (texts: string[] | null) => void;
+  // Companion to onGroundingHighlight: reports the newly selected cell's
+  // figure citation (or null when it has none), so the source panel can
+  // switch to showing that figure image instead of the source document.
+  // Fires alongside onGroundingHighlight from the same selection handler.
+  onFigureGrounding?: (figure: FigureExcerpt | null) => void;
   // Fires on each mouse click of a grounded data cell, so the source panel can
   // re-scroll to the highlight even when the same cell is clicked again.
   onGroundingScrollRequest?: () => void;
@@ -1960,6 +1966,7 @@ export function SpreadsheetSurface({
           if (row < 0 || col < 0 || row2 < 0 || col2 < 0) {
             onSelectionChange(null);
             onGroundingHighlight?.(null);
+            onFigureGrounding?.(null);
             return;
           }
           const fromRow = Math.min(row, row2);
@@ -1974,9 +1981,11 @@ export function SpreadsheetSurface({
 
           // Report the top-left cell's grounding excerpts so the source panel
           // can highlight every place the value came from (all marked; the
-          // first is scrolled into view).
-          if (onGroundingHighlight) {
+          // first is scrolled into view) — and separately, any figure
+          // citation, so the panel can show that figure's image instead.
+          if (onGroundingHighlight || onFigureGrounding) {
             let excerptTexts: string[] | null = null;
+            let figureExcerpt: FigureExcerpt | null = null;
             if (activeSheet === 'data') {
               const column = sheet.columns[fromCol];
               const hot = hotTableRef.current?.hotInstance;
@@ -1985,12 +1994,16 @@ export function SpreadsheetSurface({
                 column && physicalRow != null && physicalRow >= 0
                   ? dataGrounding[physicalRow]?.[column.key]
                   : null;
-              const texts = (grounding?.excerpts ?? [])
+              const excerpts = grounding?.excerpts ?? [];
+              const texts = excerpts
+                .filter((e): e is { text: string; source: string } => e.type !== 'figure')
                 .map((e) => e.text)
                 .filter((t): t is string => Boolean(t && t.trim()));
               excerptTexts = texts.length > 0 ? texts : null;
+              figureExcerpt = excerpts.find((e): e is FigureExcerpt => e.type === 'figure') ?? null;
             }
-            onGroundingHighlight(excerptTexts);
+            onGroundingHighlight?.(excerptTexts);
+            onFigureGrounding?.(figureExcerpt);
           }
         }}
         afterOnCellMouseDown={(event, coords) => {
@@ -2034,6 +2047,7 @@ export function SpreadsheetSurface({
           title={groundingModal.title}
           content={groundingModal.content}
           evidenceOnly
+          sessionId={sessionId}
         />
       )}
     </div>

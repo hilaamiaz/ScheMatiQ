@@ -51,6 +51,7 @@ import type {
   CostEstimate,
   DataRow,
   DocumentAvailabilityResponse,
+  FigureExcerpt,
   PaginatedData,
   ScheMatiQConfig,
   ScheMatiQStatus,
@@ -213,6 +214,9 @@ function Workspace() {
   // Grounding excerpts of the currently selected data cell, highlighted in the
   // source panel so the user can see every place the value came from.
   const [groundingHighlights, setGroundingHighlights] = useState<string[] | null>(null);
+  // Figure citation of the currently selected data cell (if any) — when set,
+  // the source panel shows this figure's image instead of the source document.
+  const [selectedFigure, setSelectedFigure] = useState<FigureExcerpt | null>(null);
   // Bumped on each grounded-cell click so the source panel re-scrolls to the
   // highlight even when the excerpt set is unchanged (same cell clicked again).
   const [groundingScrollNonce, setGroundingScrollNonce] = useState(0);
@@ -942,6 +946,18 @@ function Workspace() {
     });
   }, []);
 
+  // Companion to handleGroundingHighlight: the selected cell's figure
+  // citation (if any), so the source panel can switch to showing that
+  // figure's image. Same re-render-loop guard as above (HotTable re-emits
+  // afterSelectionEnd on every re-render).
+  const handleFigureGrounding = useCallback((figure: FigureExcerpt | null) => {
+    setSelectedFigure((current) => {
+      if (current === figure) return current;
+      if (!current || !figure) return figure;
+      return current.figure_id === figure.figure_id ? current : figure;
+    });
+  }, []);
+
   const applyTableFormat = useCallback((patch: Partial<TableDisplayOptions>) => {
     const hotSelection = hotTableRef.current?.hotInstance?.getSelectedLast?.();
     const liveSelection: SheetSelection = hotSelection
@@ -1341,6 +1357,7 @@ function Workspace() {
         searchTermRef={activeSearchTermRef}
         onSelectionChange={updateSheetSelection}
         onGroundingHighlight={handleGroundingHighlight}
+        onFigureGrounding={handleFigureGrounding}
         onGroundingScrollRequest={() => setGroundingScrollNonce((n) => n + 1)}
         onRefresh={() => refresh({ silent: true })}
         onSchemaRefresh={refreshSchemaOnly}
@@ -1581,6 +1598,12 @@ function Workspace() {
                     scrollNonce={groundingScrollNonce}
                     uploading={attachingSourceDocs}
                     onRequestUpload={attachingSourceDocs ? undefined : () => sourceDocInputRef.current?.click()}
+                    figureImageUrl={
+                      selectedFigure && sessionId
+                        ? unitsAPI.getFigureContentUrl(sessionId, selectedFigure.figure_id)
+                        : undefined
+                    }
+                    figureCaption={selectedFigure?.caption}
                   />
                 </div>
                 {dataGridNode}

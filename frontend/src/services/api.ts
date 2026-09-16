@@ -1024,6 +1024,14 @@ export const unitsAPI = {
     `${API_BASE}/units/document-content/${encodeURIComponent(sessionId)}?name=${encodeURIComponent(name)}`,
 
   /**
+   * Build the URL that serves an extracted figure's image bytes for inline
+   * viewing — a cell whose citation is figure-typed (see FigureExcerpt)
+   * points here instead of at getDocumentContentUrl's whole source document.
+   */
+  getFigureContentUrl: (sessionId: string, figureId: string): string =>
+    `${API_BASE}/units/figure-content/${encodeURIComponent(sessionId)}?figure_id=${encodeURIComponent(figureId)}`,
+
+  /**
    * Fetch a source document's raw text via the shared axios instance (so it
    * reuses the configured base URL, credentials, and interceptors). Used by the
    * highlight-capable preview to render text documents in a DOM we control.

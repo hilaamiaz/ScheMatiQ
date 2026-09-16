@@ -124,18 +124,28 @@ def _build_figure_label(fig: Dict[str, Any]) -> str:
 
     Without this, an image reaches the model as an anonymous byte blob with
     no way to know it's "Figure 4" versus any other image in the call — an
-    explicit label anchors it, e.g. "Figure 4: Fig. 4. Expression of the
-    a2,3 sialylated...". Degrades gracefully (never raises): label-only or
-    caption-only when a field is missing, "" (no text part at all) if both
-    figure_label/origin_name and caption are absent.
+    explicit label anchors it, e.g. "[figure_id: paper1_fig003] Figure 4:
+    Fig. 4. Expression of the a2,3 sialylated...". The leading
+    "[figure_id: ...]" token is a stable, model-citable identifier (see
+    `figure_refs` on the response schema) distinct from the human-readable
+    "Figure 4" label, which can repeat/reset per document and isn't unique.
+    Degrades gracefully (never raises): missing figure_id, label, or caption
+    are each just omitted rather than raising.
     """
     prefix = " ".join(
         part for part in (fig.get("figure_label"), fig.get("origin_name")) if part
     ).strip()
     caption = (fig.get("caption") or "").strip()
     if prefix and caption:
-        return f"{prefix}: {caption}"
-    return caption or prefix
+        label = f"{prefix}: {caption}"
+    else:
+        label = caption or prefix
+
+    figure_id = (fig.get("figure_id") or "").strip()
+    if not figure_id:
+        return label
+    tag = f"[figure_id: {figure_id}]"
+    return f"{tag} {label}" if label else tag
 
 
 # Type alias for value extracted callback: (row_name, column_name, value) -> None
@@ -198,6 +208,11 @@ class PaperProcessor:
         # Each entry is (label, image_bytes, mime_type); label (e.g. "Figure 4:
         # <caption>") rides as its own text part immediately before the image.
         self._active_figure_images: List[Tuple[str, bytes, str]] = []
+        # figure_id -> that figure's manifest dict, for the current document —
+        # lets _attach_source_to_excerpts cheaply validate a model-cited
+        # figure_refs entry against what was actually shown this run, instead
+        # of trusting an arbitrary string back from the model.
+        self._active_figures_by_id: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _flatten_extracted(cleaned: Dict[str, Any]) -> Dict[str, str]:
@@ -279,6 +294,7 @@ class PaperProcessor:
             self.llm.delete_context_cache(self._active_context_cache)
             self._active_context_cache = None
         self._active_figure_images = []
+        self._active_figures_by_id = {}
 
     def _ground_and_enforce(
         self, cleaned: Dict[str, Any], source_text: str, context_label: str
@@ -372,6 +388,7 @@ class PaperProcessor:
         figures extracted" on its own failures.
         """
         self._active_figure_images = []
+        self._active_figures_by_id = {}
         if not ENABLE_FIGURE_VISION_CONTEXT:
             return
         if not figures_dir:
@@ -394,6 +411,7 @@ class PaperProcessor:
 
         images: List[Tuple[str, bytes, str]] = []
         attached_ids: Set[str] = set()
+        figures_by_id: Dict[str, Dict[str, Any]] = {}
         for fig in manifest.get("figures", []):
             image_filename = fig.get("image_filename")
             if not image_filename:
@@ -410,11 +428,17 @@ class PaperProcessor:
             fig_id = fig.get("figure_id")
             if fig_id:
                 attached_ids.add(fig_id)
+                # Only a figure whose image was actually attached this run is a
+                # valid citation target — matches what the model was actually
+                # shown, so _attach_source_to_excerpts can't accept a citation
+                # for a figure the model never saw.
+                figures_by_id[fig_id] = fig
 
         if not images:
             return
 
         self._active_figure_images = images
+        self._active_figures_by_id = figures_by_id
         logger.debug(
             "Loaded %d figure image(s) for document context (%s)",
             len(images), manifest_path,
@@ -542,18 +566,47 @@ class PaperProcessor:
 
         Converts plain excerpt strings to objects with source info:
         {"text": "excerpt text", "source": "filename.txt"}
+
+        Also consumes each column's `figure_refs` (a list of figure_id
+        strings the model cited, from the response schema — see
+        schema_builder.build_extraction_response_schema): a cited figure_id
+        that matches self._active_figures_by_id (i.e. a figure actually
+        attached to this call, not an arbitrary string) becomes its own
+        figure-typed excerpt entry, {"type": "figure", "figure_id": ...,
+        "source": source_filename, "caption": ..., "image_filename": ...}.
+        An unresolvable/hallucinated figure_id is dropped rather than stored
+        — same "don't show an unverifiable citation" default as text
+        grounding. `figure_refs` itself is consumed here and not carried
+        into the stored cell (the resulting figure excerpts are the
+        durable record).
         """
+        figures_by_id = getattr(self, "_active_figures_by_id", None) or {}
         for col_name, col_value in data.items():
-            if isinstance(col_value, dict) and "excerpts" in col_value:
-                excerpts = col_value.get("excerpts", [])
-                col_value["excerpts"] = [
-                    (
-                        {"text": exc, "source": source_filename}
-                        if isinstance(exc, str)
-                        else exc
-                    )
-                    for exc in excerpts
-                ]
+            if not isinstance(col_value, dict) or "excerpts" not in col_value:
+                continue
+            excerpts = col_value.get("excerpts", [])
+            col_value["excerpts"] = [
+                (
+                    {"text": exc, "source": source_filename}
+                    if isinstance(exc, str)
+                    else exc
+                )
+                for exc in excerpts
+            ]
+
+            figure_refs = col_value.pop("figure_refs", None) or []
+            if figure_refs and figures_by_id:
+                for figure_id in figure_refs:
+                    fig = figures_by_id.get(figure_id)
+                    if not fig:
+                        continue
+                    col_value["excerpts"].append({
+                        "type": "figure",
+                        "figure_id": figure_id,
+                        "source": source_filename,
+                        "caption": fig.get("caption"),
+                        "image_filename": fig.get("image_filename"),
+                    })
         return data
 
     def _should_skip_truncation(self) -> bool:

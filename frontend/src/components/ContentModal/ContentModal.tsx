@@ -20,6 +20,7 @@ import {
 import { CellValue, ScheMatiQAnswerWithExcerpts, Excerpt, ExcerptWithSource } from '../../types';
 import { copyToClipboard } from '../../utils/clipboard';
 import { extractDisplayValue } from '../DataTable/utils/valueUtils';
+import { unitsAPI } from '../../services/api';
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
 
@@ -30,6 +31,11 @@ interface ContentModalProps {
   content: CellValue;
   onSave?: (newValue: string) => Promise<void>;
   evidenceOnly?: boolean;
+  // Needed to build the figure-image URL when an excerpt is figure-typed
+  // (see FigureExcerpt) — optional since not every caller of this modal
+  // deals with figure citations; a figure excerpt simply can't render its
+  // image without it.
+  sessionId?: string;
 }
 
 /** Extract the editable string value from a CellValue. */
@@ -80,9 +86,16 @@ const parseExcerptItem = (excerpt: Excerpt, index: number): ExcerptWithSource =>
     }
     return { text: excerpt, source: `Source ${index + 1}` };
   }
+  // Figure-typed excerpts (no `text`) must be checked before the generic
+  // 'text' in excerpt check below — falling through to the final
+  // `String(excerpt)` catch-all would stringify the whole object into
+  // "[object Object]" and destroy figure_id/caption/type entirely.
+  if (typeof excerpt === 'object' && excerpt !== null && (excerpt as { type?: string }).type === 'figure') {
+    return excerpt as ExcerptWithSource;
+  }
   if (typeof excerpt === 'object' && excerpt !== null && 'text' in excerpt) {
     return {
-      text: (excerpt as ExcerptWithSource).text,
+      text: (excerpt as ExcerptWithSource & { text: string }).text,
       source: (excerpt as ExcerptWithSource).source || `Source ${index + 1}`
     };
   }
@@ -138,6 +151,7 @@ const ContentModal: React.FC<ContentModalProps> = ({
   content,
   onSave,
   evidenceOnly = false,
+  sessionId,
 }) => {
   const [copied, setCopied] = React.useState(false);
   const [isEditing, setIsEditing] = React.useState(false);
@@ -250,7 +264,10 @@ const ContentModal: React.FC<ContentModalProps> = ({
         if (excerpts.length > 0) {
           text += '\n\nSupporting Evidence:\n';
           excerpts.forEach((excerpt) => {
-            text += `\n[${excerpt.source}]: ${excerpt.text}`;
+            const body = excerpt.type === 'figure'
+              ? `[figure ${excerpt.figure_id}]${excerpt.caption ? `: ${excerpt.caption}` : ''}`
+              : excerpt.text;
+            text += `\n[${excerpt.source}]: ${body}`;
           });
         }
         return text;
@@ -282,9 +299,30 @@ const ContentModal: React.FC<ContentModalProps> = ({
             <p className="text-xs text-muted-foreground mb-1">
               From: <span className="font-medium">{excerpt.source}</span>
             </p>
-            <p className="text-sm leading-relaxed">
-              {excerpt.text}
-            </p>
+            {excerpt.type === 'figure' ? (
+              sessionId ? (
+                <>
+                  <img
+                    src={unitsAPI.getFigureContentUrl(sessionId, excerpt.figure_id)}
+                    alt={excerpt.caption || excerpt.figure_id}
+                    className="max-w-full rounded-md border border-border"
+                  />
+                  {excerpt.caption && (
+                    <p className="text-sm leading-relaxed mt-2 text-muted-foreground">
+                      {excerpt.caption}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p className="text-sm leading-relaxed italic text-muted-foreground">
+                  Figure citation ({excerpt.figure_id}) — unavailable without a session id.
+                </p>
+              )
+            ) : (
+              <p className="text-sm leading-relaxed">
+                {excerpt.text}
+              </p>
+            )}
           </div>
         ))}
       </div>
