@@ -78,6 +78,13 @@ const parseExcerptItem = (excerpt: Excerpt, index: number): ExcerptWithSource =>
   if (typeof excerpt === 'string') {
     // Try to parse if it looks like a Python dict
     const parsed = parsePythonString(excerpt);
+    // Figure-typed excerpts must be checked before the generic 'text' in
+    // parsed check below -- a figure excerpt has no `text` key, so it would
+    // otherwise fall through to rendering the raw stringified dict as text
+    // instead of the figure image (see the object-branch check below).
+    if (typeof parsed === 'object' && parsed !== null && (parsed as { type?: string }).type === 'figure') {
+      return parsed as ExcerptWithSource;
+    }
     if (typeof parsed === 'object' && parsed !== null && 'text' in parsed) {
       return {
         text: parsed.text,

@@ -1,6 +1,7 @@
 """Paper processing for value extraction."""
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import mimetypes
@@ -386,6 +387,18 @@ class PaperProcessor:
         self._active_figure_images empty, degrading to today's text-only
         behavior exactly like figure_extraction_service.py degrades to "no
         figures extracted" on its own failures.
+
+        Not thread-safe: self._active_figure_images/_active_figures_by_id are
+        plain instance attributes reset-then-refilled per document on a
+        PaperProcessor instance that TableBuilder reuses across its whole run
+        (see TableBuilder.__init__). This is safe today only because every
+        caller of this method processes documents in a strictly sequential
+        loop (_process_papers_with_observation_units) rather than through the
+        ThreadPoolExecutor TableBuilder already uses for its other per-paper
+        path (process_single_paper). Do not route this method's callers
+        through that executor without first making this state thread-local
+        (or giving each worker its own PaperProcessor) -- concurrent calls
+        would cross-contaminate figures/citations between documents.
         """
         self._active_figure_images = []
         self._active_figures_by_id = {}
@@ -560,7 +573,7 @@ class PaperProcessor:
             )
 
     def _match_excerpt_to_figure_caption(self, excerpt_text: str) -> Optional[str]:
-        """Return the figure_id whose caption this text excerpt fuzzy-matches, or None.
+        """Return the figure_id whose caption this text excerpt best fuzzy-matches, or None.
 
         Catches the common case where the model quotes a figure's caption
         back as a normal text excerpt instead of citing it via figure_refs
@@ -570,10 +583,20 @@ class PaperProcessor:
         matching alone would miss it). Reuses self.excerpt_grounder's
         exact -> case-insensitive -> fuzzy-sliding-window matching (same
         0.6 threshold already established for grounding decisions
-        elsewhere), called with whichever of {excerpt, caption} is longer
-        as the "source text" being searched within — a caption can span
-        multiple sub-panels ("a, ... b, ...") and be much longer than the
-        quoted fragment.
+        elsewhere) as the candidate gate, called with whichever of
+        {excerpt, caption} is longer as the "source text" being searched
+        within — a caption can span multiple sub-panels ("a, ... b, ...")
+        and be much longer than the quoted fragment.
+
+        Documents can have several figures with similar/overlapping-vocabulary
+        captions (e.g. multiple bar charts), where more than one clears the
+        0.6 gate. Picking the *first* one to clear it (in manifest/page
+        order) previously meant an unrelated excerpt could get attached to
+        the wrong figure whenever a less-similar caption happened to appear
+        earlier in the document than the true match. Every candidate that
+        clears the gate is now scored with a whole-string similarity ratio
+        (difflib.SequenceMatcher) and the highest-scoring one wins; ties keep
+        the earliest (manifest order), same as before.
 
         Both strings are whitespace-normalized (collapsed to single spaces)
         before matching. Verified against a real extracted caption: Docling
@@ -591,6 +614,8 @@ class PaperProcessor:
         if not figures_by_id:
             return None
         norm_excerpt = " ".join(excerpt_text.split())
+        best_figure_id: Optional[str] = None
+        best_score = -1.0
         for figure_id, fig in figures_by_id.items():
             caption = (fig.get("caption") or "").strip()
             if not caption:
@@ -602,9 +627,13 @@ class PaperProcessor:
                 else (norm_caption, norm_excerpt)
             )
             _, _, status = self.excerpt_grounder.ground_excerpt(short, long_)
-            if status != "not_found":
-                return figure_id
-        return None
+            if status == "not_found":
+                continue
+            score = difflib.SequenceMatcher(None, norm_excerpt, norm_caption).ratio()
+            if score > best_score:
+                best_score = score
+                best_figure_id = figure_id
+        return best_figure_id
 
     def _attach_source_to_excerpts(
         self, data: Dict[str, Any], source_filename: str
@@ -631,8 +660,15 @@ class PaperProcessor:
         into the stored cell (the resulting figure excerpts are the
         durable record).
 
-        Both routes (caption-match and figure_refs) can point at the same
-        figure for one column — deduped to a single entry per figure_id.
+        The two routes are NOT run as independent, equally-trusted signals:
+        figure_refs is the model's own explicit self-report, so when a
+        column has at least one resolved figure_refs entry, the caption-match
+        fallback is skipped entirely for that column's text excerpts. The
+        fallback exists specifically to cover columns where the model didn't
+        cite a figure explicitly at all (see _match_excerpt_to_figure_caption)
+        — letting it also run on columns that already have a trustworthy
+        explicit citation only risked a second, independently-guessed (and
+        possibly wrong) figure competing with or contaminating that citation.
         """
         figures_by_id = getattr(self, "_active_figures_by_id", None) or {}
         for col_name, col_value in data.items():
@@ -640,10 +676,31 @@ class PaperProcessor:
                 continue
             excerpts = col_value.get("excerpts", [])
 
+            # Resolve the explicit citation first so we know whether the
+            # caption-match fallback should even run for this column.
+            figure_refs = col_value.pop("figure_refs", None) or []
+            resolved_refs = []
+            for figure_id in figure_refs:
+                fig = figures_by_id.get(figure_id)
+                if not fig:
+                    continue
+                resolved_refs.append({
+                    "type": "figure",
+                    "figure_id": figure_id,
+                    "source": source_filename,
+                    "caption": fig.get("caption"),
+                    "image_filename": fig.get("image_filename"),
+                })
+            allow_caption_fallback = not resolved_refs
+
             def _wrap(exc):
                 if not isinstance(exc, str):
                     return exc
-                matched_figure_id = self._match_excerpt_to_figure_caption(exc) if figures_by_id else None
+                matched_figure_id = (
+                    self._match_excerpt_to_figure_caption(exc)
+                    if figures_by_id and allow_caption_fallback
+                    else None
+                )
                 if matched_figure_id:
                     fig = figures_by_id[matched_figure_id]
                     return {
@@ -655,25 +712,12 @@ class PaperProcessor:
                     }
                 return {"text": exc, "source": source_filename}
 
-            col_value["excerpts"] = [_wrap(exc) for exc in excerpts]
+            col_value["excerpts"] = [_wrap(exc) for exc in excerpts] + resolved_refs
 
-            figure_refs = col_value.pop("figure_refs", None) or []
-            if figure_refs and figures_by_id:
-                for figure_id in figure_refs:
-                    fig = figures_by_id.get(figure_id)
-                    if not fig:
-                        continue
-                    col_value["excerpts"].append({
-                        "type": "figure",
-                        "figure_id": figure_id,
-                        "source": source_filename,
-                        "caption": fig.get("caption"),
-                        "image_filename": fig.get("image_filename"),
-                    })
-
-            # Dedup figure-typed entries by figure_id (caption-match and an
-            # explicit figure_refs citation can independently point at the
-            # same figure); keep text excerpts and first-seen order as-is.
+            # Dedup figure-typed entries by figure_id (kept as a safety net;
+            # with the fallback now mutually exclusive with figure_refs per
+            # column, there's rarely anything left to dedup). Keep text
+            # excerpts and first-seen order as-is.
             seen_figure_ids = set()
             deduped = []
             for exc in col_value["excerpts"]:

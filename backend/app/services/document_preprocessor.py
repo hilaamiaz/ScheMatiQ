@@ -100,11 +100,21 @@ def commit_document_to_documents_dir(
         # never reaches this function. See its docstring for why documents_dir
         # is threaded through: figures land straight in their final location
         # instead of needing to be moved alongside the .txt below.
+        #
+        # Reserve the final (de-duplicated) stem up front, before conversion
+        # runs, and pass it through as figure_stem: a same-named document
+        # committed into an already-populated documents_dir (e.g. two source
+        # files that happen to share a base name) would otherwise persist its
+        # figures under the *raw* stem, silently overwriting an earlier
+        # document's figures/{stem}/ folder — the dedup below (which the .txt
+        # file itself benefits from) only runs after that damage is done.
+        reserved_stem = unique_dest_path(documents_dir, f"{source_path.stem}.txt").stem
         result = preprocess_uploaded_file(
             source_path,
             worker_id=worker_id,
             original_filename=source_path.name,
             documents_dir=documents_dir,
+            figure_stem=reserved_stem,
         )
         if not result.success:
             logger.warning(
@@ -281,6 +291,7 @@ def preprocess_uploaded_file(
     worker_id: Optional[str] = None,
     original_filename: Optional[str] = None,
     documents_dir: Optional[Path] = None,
+    figure_stem: Optional[str] = None,
 ) -> ExtractionResult:
     """Convert an uploaded file to plain text in-place.
 
@@ -297,6 +308,16 @@ def preprocess_uploaded_file(
     (pending_documents/ during the initial upload), so they land in their
     final location immediately rather than needing to be moved/renamed
     alongside the .txt by whatever later commits it into documents/.
+
+    ``figure_stem`` lets a caller that already knows the document's *final*
+    (collision-free) name reserve that name for figure persistence too — see
+    commit_document_to_documents_dir, which computes this before conversion
+    runs so a same-stem document doesn't overwrite an earlier one's figures
+    under documents_dir/figures/{stem}/ (persist_figures() would otherwise key
+    off source_path's raw stem, before the .txt output is later de-duplicated
+    with a _N suffix by the caller). Defaults to the raw stem when omitted
+    (e.g. the initial-upload route, which rejects same-stem re-uploads
+    upfront and so never needs this).
     """
     orig_name = original_filename or source_path.name
 
@@ -368,7 +389,7 @@ def preprocess_uploaded_file(
 
         if figure_build is not None:
             from app.services.figure_extraction_service import persist_figures
-            persist_figures(figure_build, figures_dir, final_output.stem, source_document=orig_name)
+            persist_figures(figure_build, figures_dir, figure_stem or final_output.stem, source_document=orig_name)
 
         return ExtractionResult(
             output_path=final_output,

@@ -334,6 +334,33 @@ class TestMatchExcerptToFigureCaption:
 
         assert figure_id == "paper1_fig002"
 
+    def test_best_scoring_match_wins_not_the_first_to_clear_the_threshold(self):
+        # Regression for the "shows me the wrong figure" bug: when more than
+        # one caption clears the 0.6 gate, the closest match must win even if
+        # a weaker match appears earlier in the manifest. caption_low
+        # trivially clears the gate (the excerpt is verbatim embedded in a
+        # much longer, mostly-unrelated caption -- an "exact" substring hit)
+        # but is a poor overall match; caption_high is a near-verbatim quote
+        # (differs by one digit) with a much higher whole-string similarity.
+        # caption_low is listed first, so the old first-match behavior would
+        # have picked it.
+        excerpt = "Revenue growth of twenty percent was observed across all regions in 2020."
+        caption_low = (
+            "Figure 7. Overview of full company operations. Revenue growth of "
+            "twenty percent was observed across all regions in 2020. Additional "
+            "discussion of staffing, logistics, and five-year strategic plan "
+            "follows in the appendix below for reference."
+        )
+        caption_high = "Revenue growth of twenty percent was observed across all regions in 2019."
+        s = _make_self(figures_by_id={
+            "paper1_fig007": {"caption": caption_low},
+            "paper1_fig008": {"caption": caption_high},
+        })
+
+        figure_id = s._match_excerpt_to_figure_caption(excerpt)
+
+        assert figure_id == "paper1_fig008"
+
     def test_no_figures_attached_returns_none_without_raising(self):
         s = _make_self(figures_by_id={})
         assert s._match_excerpt_to_figure_caption(REAL_MODEL_QUOTED_EXCERPT) is None
@@ -342,10 +369,13 @@ class TestMatchExcerptToFigureCaption:
         s = _make_self(figures_by_id={"paper1_fig001": {}})
         assert s._match_excerpt_to_figure_caption(REAL_MODEL_QUOTED_EXCERPT) is None
 
-    def test_caption_match_and_explicit_figure_refs_for_same_figure_are_deduped(self):
-        # A column could have a text excerpt that caption-matches figure X
-        # *and* an explicit figure_refs citation for the same figure X (the
-        # model half-complying) -- must not produce two entries for it.
+    def test_explicit_figure_refs_skips_caption_fallback_for_that_column(self):
+        # A column with a resolved figure_refs citation trusts that explicit
+        # signal and does not also run the caption-match fallback on its text
+        # excerpts -- even one that would otherwise caption-match the same
+        # figure stays as plain text, so the model's quote isn't silently
+        # discarded, and the fallback never gets a chance to (mis)guess a
+        # *different* figure for an unrelated excerpt in the same column.
         s = _make_self(figures_by_id={
             "286888a0_fig004": {
                 "caption": REAL_CAPTION_WITH_DOUBLE_SPACES,
@@ -363,8 +393,10 @@ class TestMatchExcerptToFigureCaption:
         result = PaperProcessor._attach_source_to_excerpts(s, data, "286888a0")
 
         excerpts = result["figure_id"]["excerpts"]
-        assert len(excerpts) == 1
-        assert excerpts[0]["figure_id"] == "286888a0_fig004"
+        assert len(excerpts) == 2
+        assert excerpts[0] == {"text": REAL_MODEL_QUOTED_EXCERPT, "source": "286888a0"}
+        assert excerpts[1]["type"] == "figure"
+        assert excerpts[1]["figure_id"] == "286888a0_fig004"
 
 
 # ---------------------------------------------------------------------------

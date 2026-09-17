@@ -34,11 +34,17 @@ const extensionOf = (name: string): string => {
 
 type Availability = 'idle' | 'checking' | 'ok' | 'unavailable';
 
+/** A figure citation's image + optional caption, ready to render. */
+interface FigureItem {
+  url: string;
+  caption?: string;
+}
+
 interface DocumentPreviewProps {
   sessionId: string | null | undefined;
   /** Source-document name (raw value, as returned by the documents endpoint). */
   documentName: string | null;
-  /** Message shown when no document is selected. */
+  /** Message shown when no document and no figures are selected. */
   emptyHint?: string;
   /**
    * Bump this to force a fresh availability probe and iframe reload — e.g. after
@@ -71,15 +77,13 @@ interface DocumentPreviewProps {
    */
   scrollNonce?: number;
   /**
-   * When set, short-circuits everything else in this component and just
-   * shows this figure image directly (an <img>, not the iframe/text-highlight
-   * machinery) — used when the selected cell's citation is figure-typed
-   * (FigureExcerpt) rather than pointing at a document to highlight text in.
-   * Takes priority over documentName/sessionId resolution when present.
+   * The selected cell's figure citations (if any), rendered as a stacked
+   * gallery below the document (or on their own, full-height, when there's no
+   * document to show). Unlike the document body, figures render directly with
+   * no HEAD-probe/availability gate — the same approach ContentModal's popup
+   * already uses successfully, and simpler: an <img> either loads or doesn't.
    */
-  figureImageUrl?: string;
-  /** Optional caption shown under the figure image / as its header label. */
-  figureCaption?: string;
+  figures?: FigureItem[] | null;
 }
 
 /**
@@ -99,6 +103,10 @@ interface DocumentPreviewProps {
  * are visible as the user scrolls. PDFs/images/HTML cannot be annotated inside
  * their native iframe, so they keep the iframe and show a brief note when a
  * highlight was requested.
+ *
+ * When the selected cell also (or only) cites figures, they render as a
+ * gallery stacked below the document body, separated by a divider — or on
+ * their own when there's no document (e.g. a figure-only citation).
  */
 const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   sessionId,
@@ -109,16 +117,14 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   uploading,
   highlightTexts,
   scrollNonce,
-  figureImageUrl,
-  figureCaption,
+  figures,
 }) => {
   const contentUrl = useMemo(() => {
-    if (figureImageUrl) return figureImageUrl;
     if (!sessionId || !documentName) return null;
     const base = unitsAPI.getDocumentContentUrl(sessionId, documentName);
     // Cache-bust so a freshly uploaded file isn't masked by a cached 404/response.
     return reloadToken ? `${base}&_t=${reloadToken}` : base;
-  }, [figureImageUrl, sessionId, documentName, reloadToken]);
+  }, [sessionId, documentName, reloadToken]);
 
   const [availability, setAvailability] = useState<Availability>('idle');
 
@@ -144,19 +150,23 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   const ext = documentName ? extensionOf(documentName) : '';
   const canRenderInline = ext === '' || INLINE_EXTENSIONS.has(ext);
   const needsSandbox = SANDBOX_EXTENSIONS.has(ext);
-  const showOpenFull = Boolean(contentUrl) && availability === 'ok';
 
   // Highlight mode is opt-in (the prop is present) and only applies to text
-  // formats we can render and annotate ourselves. A figure image is never
-  // text-renderable regardless of what `ext` defaults to with no
-  // documentName (empty ext would otherwise default isTextRenderable to
-  // true and try to fetch document *text* for a null documentName, getting
-  // stuck on a permanent "Loading…" instead of showing the image) — so
-  // figureImageUrl always forces the plain image path, ignoring any
-  // highlightTexts the caller might still be passing from a prior selection.
-  const highlightEnabled = !figureImageUrl && highlightTexts !== undefined;
-  const isTextRenderable = !figureImageUrl && (ext === '' || TEXT_EXTENSIONS.has(ext));
+  // formats we can render and annotate ourselves.
+  const highlightEnabled = highlightTexts !== undefined;
+  const isTextRenderable = ext === '' || TEXT_EXTENSIONS.has(ext);
   const useInlineText = highlightEnabled && isTextRenderable;
+
+  const hasDocument = Boolean(contentUrl);
+  const hasFigures = Boolean(figures && figures.length > 0);
+  const hasTextGrounding = Boolean(highlightTexts && highlightTexts.length > 0);
+  // Only suppress the document section when we're in cell-grounding mode
+  // (highlightEnabled -- never true for the plain Documents tab, which never
+  // passes highlightTexts) AND this specific cell's citation is figure-only:
+  // a real text excerpt (or not being grounding-driven at all) always keeps
+  // the document visible.
+  const showDocumentSection = hasDocument && !(highlightEnabled && hasFigures && !hasTextGrounding);
+  const showOpenFull = showDocumentSection && availability === 'ok';
 
   const [text, setText] = useState<string | null>(null);
   const [textError, setTextError] = useState(false);
@@ -254,14 +264,8 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
     );
   };
 
-  const renderBody = () => {
-    if (!contentUrl) {
-      return (
-        <div className="h-full flex items-center justify-center text-sm text-muted-foreground text-center px-4">
-          {emptyHint || 'Select a document to preview it.'}
-        </div>
-      );
-    }
+  /** Renders the document body. Only called when contentUrl is set. */
+  const renderDocumentBody = () => {
     if (availability === 'checking' || availability === 'idle') {
       return (
         <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
@@ -303,24 +307,6 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
         </div>
       );
     }
-    if (figureImageUrl) {
-      // Dedicated <img> render, not the generic iframe path below: an
-      // <iframe src="...png"> resolves to the browser's own bare
-      // image-document rendering, which gets none of this app's
-      // sizing/centering and can end up oversized/mispositioned inside the
-      // panel's constrained box -- reading as blank. A plain <img>, the
-      // same approach already proven working in ContentModal's popup,
-      // avoids that entirely.
-      return (
-        <div className="h-full w-full flex items-center justify-center overflow-auto p-2">
-          <img
-            src={contentUrl as string}
-            alt={figureCaption || 'Figure'}
-            className="max-w-full max-h-full object-contain"
-          />
-        </div>
-      );
-    }
     if (useInlineText && !contentIsBinary) {
       return renderInlineText();
     }
@@ -328,7 +314,7 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
       return (
         <iframe
           key={contentUrl}
-          src={contentUrl}
+          src={contentUrl as string}
           title={documentName || 'Document preview'}
           className="w-full h-full border-0"
           {...(needsSandbox ? { sandbox: '' } : {})}
@@ -340,7 +326,7 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
         <FileText className="h-8 w-8 opacity-40" />
         <span>Preview isn&apos;t available for .{ext} files.</span>
         <a
-          href={contentUrl}
+          href={contentUrl as string}
           target="_blank"
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md border border-border hover:bg-muted/50 transition-colors text-foreground"
@@ -360,14 +346,18 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
     availability === 'ok' &&
     canRenderInline;
 
+  const figureLabel = hasFigures
+    ? (figures!.length === 1 ? (figures![0].caption || 'Figure') : `${figures!.length} figures`)
+    : null;
+  const headerLabel = showDocumentSection
+    ? (documentName || 'Document')
+    : figureLabel || documentName || 'No document selected';
+
   return (
     <div className="flex-1 min-w-0 h-full flex flex-col">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border text-xs">
-        <span
-          className="truncate text-muted-foreground"
-          title={figureImageUrl ? (figureCaption || 'Figure') : (documentName || '')}
-        >
-          {figureImageUrl ? (figureCaption || 'Figure') : (documentName || 'No document selected')}
+        <span className="truncate text-muted-foreground" title={headerLabel}>
+          {headerLabel}
         </span>
         <span className="flex-1" />
         {showOpenFull && (
@@ -385,11 +375,41 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
 
       {showHighlightUnsupportedNote && (
         <div className="px-3 py-1.5 text-[11px] text-muted-foreground border-b border-border bg-muted/20">
-          Source highlighting isn&apos;t available for .{ext || 'this'} files — see the grounding popup for the excerpt.
+          Source highlighting isn&apos;t available for .{ext || 'this'} files — see the figures below for image citations.
         </div>
       )}
 
-      <div className="flex-1 min-h-0 bg-muted/20">{renderBody()}</div>
+      <div className="flex-1 min-h-0 bg-muted/20 overflow-y-auto flex flex-col">
+        {!showDocumentSection && !hasFigures && (
+          <div className="h-full flex items-center justify-center text-sm text-muted-foreground text-center px-4">
+            {emptyHint || 'Select a document to preview it.'}
+          </div>
+        )}
+        {showDocumentSection && (
+          <div className={hasFigures ? 'h-[50vh] shrink-0' : 'flex-1 min-h-0'}>
+            {renderDocumentBody()}
+          </div>
+        )}
+        {showDocumentSection && hasFigures && <div className="border-t border-border shrink-0" />}
+        {hasFigures && (
+          <div className="p-3 flex flex-col gap-4">
+            {figures!.map((fig) => (
+              <div key={fig.url}>
+                <img
+                  src={fig.url}
+                  alt={fig.caption || 'Figure'}
+                  className="max-w-full rounded-md border border-border"
+                />
+                {fig.caption && (
+                  <p className="text-sm leading-relaxed mt-2 text-muted-foreground">
+                    {fig.caption}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };

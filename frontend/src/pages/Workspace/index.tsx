@@ -214,9 +214,9 @@ function Workspace() {
   // Grounding excerpts of the currently selected data cell, highlighted in the
   // source panel so the user can see every place the value came from.
   const [groundingHighlights, setGroundingHighlights] = useState<string[] | null>(null);
-  // Figure citation of the currently selected data cell (if any) — when set,
-  // the source panel shows this figure's image instead of the source document.
-  const [selectedFigure, setSelectedFigure] = useState<FigureExcerpt | null>(null);
+  // Figure citations of the currently selected data cell (if any) — when set,
+  // the source panel shows these figure images alongside the source document.
+  const [selectedFigures, setSelectedFigures] = useState<FigureExcerpt[] | null>(null);
   // Bumped on each grounded-cell click so the source panel re-scrolls to the
   // highlight even when the excerpt set is unchanged (same cell clicked again).
   const [groundingScrollNonce, setGroundingScrollNonce] = useState(0);
@@ -947,14 +947,16 @@ function Workspace() {
   }, []);
 
   // Companion to handleGroundingHighlight: the selected cell's figure
-  // citation (if any), so the source panel can switch to showing that
-  // figure's image. Same re-render-loop guard as above (HotTable re-emits
-  // afterSelectionEnd on every re-render).
-  const handleFigureGrounding = useCallback((figure: FigureExcerpt | null) => {
-    setSelectedFigure((current) => {
-      if (current === figure) return current;
-      if (!current || !figure) return figure;
-      return current.figure_id === figure.figure_id ? current : figure;
+  // citations (if any), so the source panel can show those figure images
+  // alongside the source document. Same re-render-loop guard as above
+  // (HotTable re-emits afterSelectionEnd on every re-render) — compares by a
+  // key of figure_ids rather than array identity so an equivalent list from a
+  // fresh render doesn't trigger a state update.
+  const handleFigureGrounding = useCallback((figures: FigureExcerpt[] | null) => {
+    setSelectedFigures((current) => {
+      const currentKey = current?.map((f) => f.figure_id).join(',') ?? '';
+      const nextKey = figures?.map((f) => f.figure_id).join(',') ?? '';
+      return currentKey === nextKey ? current : figures;
     });
   }, []);
 
@@ -1599,12 +1601,14 @@ function Workspace() {
                     scrollNonce={groundingScrollNonce}
                     uploading={attachingSourceDocs}
                     onRequestUpload={attachingSourceDocs ? undefined : () => sourceDocInputRef.current?.click()}
-                    figureImageUrl={
-                      selectedFigure && sessionId
-                        ? unitsAPI.getFigureContentUrl(sessionId, selectedFigure.figure_id)
+                    figures={
+                      selectedFigures && sessionId
+                        ? selectedFigures.map((f) => ({
+                            url: unitsAPI.getFigureContentUrl(sessionId, f.figure_id),
+                            caption: f.caption,
+                          }))
                         : undefined
                     }
-                    figureCaption={selectedFigure?.caption}
                   />
                 </div>
                 {dataGridNode}

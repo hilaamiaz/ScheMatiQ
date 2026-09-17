@@ -382,6 +382,34 @@ async def get_figure_content(
     return StreamingResponse(io.BytesIO(content), media_type=media_type, headers=headers)
 
 
+@router.head(
+    "/figure-content/{session_id}",
+    summary="Probe whether an extracted figure image can be served",
+    description="Lightweight availability check used by the document viewer's HEAD probe.",
+)
+async def head_figure_content(
+    session_id: str,
+    figure_id: str = Query(..., description="Figure id, e.g. 'paper1_fig003'"),
+):
+    """Return 200 if the figure is resolvable, else 404.
+
+    FastAPI does not auto-answer HEAD for a GET route (see head_document_content
+    above), so the Show Source panel's HEAD availability probe needs this
+    explicit handler for figure images too -- without it, every figure citation
+    probe hit a 405 and the panel permanently showed "not available".
+    """
+    from fastapi.responses import Response
+
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if _find_figure(session_id, figure_id) is not None:
+        return Response(status_code=200)
+
+    raise HTTPException(status_code=404, detail="Figure not found in this session")
+
+
 # Per-file ceiling, mirroring the add-documents upload guard.
 _MAX_ATTACH_FILE_BYTES = 25 * 1024 * 1024
 
