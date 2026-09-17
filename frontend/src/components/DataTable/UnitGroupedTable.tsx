@@ -1138,6 +1138,7 @@ export const UnitGroupedTable: React.FC<UnitGroupedTableProps> = ({
         open={modalOpen}
         onClose={() => setModalOpen(false)}
         title={modalContent.title}
+        sessionId={sessionId}
         content={(() => {
           // Derive content from live unitData so undo/refetch updates the modal
           if (modalContent.rowName && modalContent.column) {
