@@ -50,6 +50,38 @@ class TestExcerptGrounder:
         start, end, status = self.grounder.ground_excerpt("dog", source)
         assert status == "not_found"
 
+    def test_fuzzy_match_with_irregular_spacing(self):
+        """A real fuzzy match must not be lost to double-spaced source text.
+
+        Docling leaves PDF-justification double-space artifacts in extracted
+        text (e.g. "Fig.  1 a, Stimulation  by  SEM..."). Rejoining the
+        matched word window with single spaces and re-`.find()`-ing it
+        against the original (irregularly spaced) source used to make a real
+        match report "not_found" purely on whitespace.
+        """
+        source = "The  model  achieved  an  accuracy  of  86.4  percent  on  MMLU."
+        start, end, status = self.grounder.ground_excerpt(
+            "accuracy of 86.4% on MMLU", source
+        )
+        assert status == "fuzzy"
+        assert start is not None and end is not None
+        # 5-word window (matching the excerpt's own 5 tokens); the excerpt's
+        # "86.4%" folds source's "86.4"+"percent" into one token, so the
+        # window can't also reach "MMLU" -- the important thing is the
+        # double-spacing between real words was preserved, not collapsed or
+        # mis-searched.
+        assert source[start:end] == "accuracy  of  86.4  percent  on"
+
+    def test_fuzzy_match_offsets_point_at_real_span(self):
+        """The returned (start, end) must slice out the actual matched words,
+        not an offset recovered by re-searching a differently-spaced string."""
+        source = "Intro text. The model achieved an accuracy of 86.4 percent on MMLU. Outro."
+        start, end, status = self.grounder.ground_excerpt(
+            "accuracy of 86.4% on MMLU", source
+        )
+        assert status == "fuzzy"
+        assert source[start:end] == "accuracy of 86.4 percent on"
+
 
 class TestGroundAllExcerpts:
     def setup_method(self):

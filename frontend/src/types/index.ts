@@ -429,6 +429,14 @@ export interface TextExcerpt {
   type?: undefined;
   text: string;
   source: string;  // Source filename
+  // Set when the backend already located this excerpt in the source
+  // document (ExcerptGrounder.ground_all_excerpts). When present, the
+  // document viewer uses this span directly instead of re-searching for
+  // `text` client-side -- the backend's matching tolerates paraphrasing
+  // (fuzzy sliding-window match) that the frontend's own search does not.
+  char_start?: number;
+  char_end?: number;
+  grounding_status?: 'exact' | 'case_insensitive' | 'fuzzy' | 'not_found';
 }
 
 // A citation backed by a figure (image/table crop extracted from a source

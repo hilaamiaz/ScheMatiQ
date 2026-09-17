@@ -56,6 +56,7 @@ import type {
   ScheMatiQConfig,
   ScheMatiQStatus,
   SchemaData,
+  TextExcerpt,
   VisualizationSession,
 } from '@/types';
 import type { DocumentListResponse } from '@/types/unit';
@@ -213,7 +214,7 @@ function Workspace() {
   const [showSourcePanel, setShowSourcePanel] = useState(false);
   // Grounding excerpts of the currently selected data cell, highlighted in the
   // source panel so the user can see every place the value came from.
-  const [groundingHighlights, setGroundingHighlights] = useState<string[] | null>(null);
+  const [groundingHighlights, setGroundingHighlights] = useState<TextExcerpt[] | null>(null);
   // Figure citations of the currently selected data cell (if any) — when set,
   // the source panel shows these figure images alongside the source document.
   const [selectedFigures, setSelectedFigures] = useState<FigureExcerpt[] | null>(null);
@@ -933,16 +934,14 @@ function Workspace() {
 
   // Dedupe like updateSheetSelection: HotTable re-emits afterSelectionEnd on
   // every re-render, so returning the previous value for an unchanged excerpt
-  // set is required to avoid an infinite render loop.
-  const handleGroundingHighlight = useCallback((texts: string[] | null) => {
+  // set is required to avoid an infinite render loop. Compares by content
+  // (not array/object identity) since the excerpt objects can be freshly
+  // parsed on a given render.
+  const handleGroundingHighlight = useCallback((excerpts: TextExcerpt[] | null) => {
     setGroundingHighlights((current) => {
-      if (current === texts) return current;
-      if (!current || !texts) return texts;
-      if (current.length !== texts.length) return texts;
-      for (let i = 0; i < current.length; i += 1) {
-        if (current[i] !== texts[i]) return texts;
-      }
-      return current;
+      const currentKey = JSON.stringify((current ?? []).map((e) => [e.text, e.char_start ?? null]));
+      const nextKey = JSON.stringify((excerpts ?? []).map((e) => [e.text, e.char_start ?? null]));
+      return currentKey === nextKey ? current : excerpts;
     });
   }, []);
 

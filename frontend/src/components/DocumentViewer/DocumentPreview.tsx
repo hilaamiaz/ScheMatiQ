@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { FileText, ExternalLink, Download, FileX, Upload, Loader2 } from 'lucide-react';
 
 import { unitsAPI } from '../../services/api';
+import type { TextExcerpt } from '../../types';
 import { findHighlightRanges } from './highlightUtils';
 
 /** Extensions the browser can render inline in an <iframe>. */
@@ -68,8 +69,12 @@ interface DocumentPreviewProps {
    * (even `null`/`[]`) enables the highlight-capable inline text renderer for
    * text-based formats; the Documents tab omits it and keeps the plain iframe.
    * All excerpts are marked; the first found match is scrolled into view.
+   * When an excerpt carries `char_start`/`char_end` (the backend already
+   * located it via ExcerptGrounder), that span is used directly instead of
+   * re-searching for `text` client-side -- the backend's matching tolerates
+   * paraphrasing that the frontend's own search does not.
    */
-  highlightTexts?: string[] | null;
+  highlightTexts?: TextExcerpt[] | null;
   /**
    * Changes on every user click of a grounded cell. Re-scrolls to the first
    * highlight even when the excerpt set is unchanged (e.g. the user scrolled the
@@ -209,6 +214,17 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
     () => (useInlineText ? findHighlightRanges(text, highlightTexts) : []),
     [useInlineText, text, highlightTexts],
   );
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== 'development') return;
+    if (useInlineText && text && highlightTexts && highlightTexts.length > 0 && highlightRanges.length === 0) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[DocumentPreview] No highlight match found for excerpt(s):',
+        highlightTexts.map((e) => e.text),
+      );
+    }
+  }, [useInlineText, text, highlightTexts, highlightRanges]);
 
   const firstMarkRef = useRef<HTMLElement | null>(null);
   useEffect(() => {

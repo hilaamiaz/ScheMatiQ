@@ -18,7 +18,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
 import { observationUnitAPI, schemaAPI, schematiqAPI } from '@/services/api';
-import type { ColumnInfo, DataRow, FigureExcerpt, PaginatedData, SchemaData } from '@/types';
+import type { ColumnInfo, DataRow, FigureExcerpt, PaginatedData, SchemaData, TextExcerpt } from '@/types';
 import { formatColumnName } from '@/utils/formatting';
 import type { EditCommand } from './hooks/useEditHistory';
 
@@ -117,8 +117,11 @@ export function SpreadsheetSurface({
   searchTermRef?: MutableRefObject<string | null>;
   onSelectionChange: (selection: SheetSelection) => void;
   // Reports all grounding excerpts of the newly selected data cell (or null when
-  // the cell has no grounding), so the source panel can highlight them.
-  onGroundingHighlight?: (texts: string[] | null) => void;
+  // the cell has no grounding), so the source panel can highlight them. Passed
+  // as full excerpt objects (not bare strings) so a backend-computed
+  // char_start/char_end -- when present -- can be used directly instead of
+  // re-searching for the text client-side.
+  onGroundingHighlight?: (excerpts: TextExcerpt[] | null) => void;
   // Companion to onGroundingHighlight: reports the newly selected cell's
   // figure citations (or null when it has none), so the source panel can
   // show those figure images alongside the source document. Fires alongside
@@ -1984,7 +1987,7 @@ export function SpreadsheetSurface({
           // first is scrolled into view) — and separately, every figure
           // citation, so the panel can show those figure images alongside it.
           if (onGroundingHighlight || onFigureGrounding) {
-            let excerptTexts: string[] | null = null;
+            let textExcerpts: TextExcerpt[] | null = null;
             let figureExcerpts: FigureExcerpt[] | null = null;
             if (activeSheet === 'data') {
               const column = sheet.columns[fromCol];
@@ -1996,14 +1999,13 @@ export function SpreadsheetSurface({
                   : null;
               const excerpts = grounding?.excerpts ?? [];
               const texts = excerpts
-                .filter((e): e is { text: string; source: string } => e.type !== 'figure')
-                .map((e) => e.text)
-                .filter((t): t is string => Boolean(t && t.trim()));
-              excerptTexts = texts.length > 0 ? texts : null;
+                .filter((e): e is TextExcerpt => e.type !== 'figure')
+                .filter((e) => Boolean(e.text && e.text.trim()));
+              textExcerpts = texts.length > 0 ? texts : null;
               const figures = excerpts.filter((e): e is FigureExcerpt => e.type === 'figure');
               figureExcerpts = figures.length > 0 ? figures : null;
             }
-            onGroundingHighlight?.(excerptTexts);
+            onGroundingHighlight?.(textExcerpts);
             onFigureGrounding?.(figureExcerpts);
           }
         }}

@@ -1,6 +1,7 @@
 """Verify extraction excerpts against source text for hallucination detection."""
 
 import difflib
+import re
 from typing import Optional, Tuple
 
 
@@ -52,7 +53,14 @@ class ExcerptGrounder:
         if len(excerpt_words) < 3:
             return None, None, "not_found"
 
-        source_words = source_text.split()
+        # Tokenize with each word's own (start, end) span in source_text, so
+        # the matched window's real character range can be read off directly
+        # instead of rejoining words with single spaces and re-`.find()`-ing
+        # that string in source_text — which silently fails (reports
+        # "not_found") whenever the source has irregular spacing, e.g.
+        # Docling's PDF-justification double-spaces.
+        word_spans = [(m.group(), m.start(), m.end()) for m in re.finditer(r"\S+", source_text)]
+        source_words = [w for w, _, _ in word_spans]
         window_size = len(excerpt_words)
 
         if window_size > len(source_words):
@@ -83,10 +91,9 @@ class ExcerptGrounder:
                 best_pos = i
 
         if best_ratio >= self.fuzzy_threshold and best_pos is not None:
-            matched_text = " ".join(source_words[best_pos : best_pos + window_size])
-            char_start = source_text.find(matched_text)
-            if char_start >= 0:
-                return char_start, char_start + len(matched_text), "fuzzy"
+            char_start = word_spans[best_pos][1]
+            char_end = word_spans[best_pos + window_size - 1][2]
+            return char_start, char_end, "fuzzy"
 
         return None, None, "not_found"
 

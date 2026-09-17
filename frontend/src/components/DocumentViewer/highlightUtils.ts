@@ -125,22 +125,67 @@ export function findHighlightRange(
   return null;
 }
 
+/** Minimal shape findHighlightRanges needs from a grounding excerpt. */
+export interface ExcerptLike {
+  text?: string | null;
+  char_start?: number | null;
+  char_end?: number | null;
+}
+
+/** First "real" (letter/digit-containing) word of a normalized string. */
+function firstWord(s: string): string {
+  return foldNormalized(s).split(' ').find((w) => /[a-z0-9]/i.test(w)) ?? '';
+}
+
 /**
- * Locate every excerpt in `queries` within `text`, splitting each on internal
- * ellipsis so multi-passage excerpts highlight all their parts. Returns ranges
- * sorted by start offset with overlaps removed (so we never render nested
- * marks). The caller scrolls to the first; the rest are found by scrolling.
+ * Cheap sanity check that a stored [char_start, char_end) offset still points
+ * at roughly the right place -- guards against stale offsets if the document
+ * on disk was ever replaced. Deliberately loose (first word only, not a full
+ * comparison): the backend's own fuzzy grounding can legitimately diverge
+ * from the excerpt's exact wording past the first word.
+ */
+function offsetRoughlyMatches(sourceSlice: string, excerptText: string): boolean {
+  const a = firstWord(sourceSlice);
+  const b = firstWord(excerptText);
+  return a.length > 0 && a === b;
+}
+
+/**
+ * Locate every excerpt in `excerpts` within `text`, splitting each on
+ * internal ellipsis so multi-passage excerpts highlight all their parts.
+ * Returns ranges sorted by start offset with overlaps removed (so we never
+ * render nested marks). The caller scrolls to the first; the rest are found
+ * by scrolling.
+ *
+ * When an excerpt carries a valid `char_start`/`char_end` (the backend
+ * already located it via ExcerptGrounder, whose fuzzy matching tolerates
+ * paraphrasing this module's own text search does not), that span is used
+ * directly instead of re-searching for `text`.
  */
 export function findHighlightRanges(
   text: string | null | undefined,
-  queries: ReadonlyArray<string | null | undefined> | null | undefined,
+  excerpts: ReadonlyArray<string | ExcerptLike | null | undefined> | null | undefined,
 ): Range[] {
-  if (!text || !queries || queries.length === 0) return [];
+  if (!text || !excerpts || excerpts.length === 0) return [];
 
   const found: Range[] = [];
-  for (const q of queries) {
-    if (!q) continue;
-    for (const fragment of splitExcerptFragments(q)) {
+  for (const exc of excerpts) {
+    if (!exc) continue;
+    const excerptText = typeof exc === 'string' ? exc : exc.text;
+    if (!excerptText) continue;
+
+    const start = typeof exc === 'object' ? exc.char_start : undefined;
+    const end = typeof exc === 'object' ? exc.char_end : undefined;
+    if (
+      typeof start === 'number' && typeof end === 'number' &&
+      start >= 0 && end > start && end <= text.length &&
+      offsetRoughlyMatches(text.slice(start, end), excerptText)
+    ) {
+      found.push([start, end]);
+      continue;
+    }
+
+    for (const fragment of splitExcerptFragments(excerptText)) {
       const range = findHighlightRange(text, fragment);
       if (range) found.push(range);
     }

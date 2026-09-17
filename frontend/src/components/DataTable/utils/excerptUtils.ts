@@ -49,6 +49,11 @@ export function parseExcerpts(excerpts: unknown[]): ParsedExcerpt[] {
         result.push({
           text: String(obj.text || ''),
           source: String(obj.source || `Source ${result.length + 1}`),
+          ...(typeof obj.char_start === 'number' ? { char_start: obj.char_start } : {}),
+          ...(typeof obj.char_end === 'number' ? { char_end: obj.char_end } : {}),
+          ...(typeof obj.grounding_status === 'string'
+            ? { grounding_status: obj.grounding_status as TextExcerpt['grounding_status'] }
+            : {}),
         });
       }
     }

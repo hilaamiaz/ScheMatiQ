@@ -45,6 +45,35 @@ describe('parseExcerpts', () => {
     expect(result).toEqual([{ text: 'We propose Mamba...', source: 'Source 1' }]);
   });
 
+  it('preserves backend grounding offsets (char_start/char_end/grounding_status) on a text excerpt', () => {
+    const result = parseExcerpts([
+      {
+        text: 'We propose Mamba...',
+        source: 'paper1.pdf',
+        char_start: 120,
+        char_end: 140,
+        grounding_status: 'fuzzy',
+      },
+    ]);
+
+    expect(result).toEqual([
+      {
+        text: 'We propose Mamba...',
+        source: 'paper1.pdf',
+        char_start: 120,
+        char_end: 140,
+        grounding_status: 'fuzzy',
+      },
+    ]);
+  });
+
+  it('omits grounding offset fields when absent rather than inventing them', () => {
+    const result = parseExcerpts([{ text: 'We propose Mamba...', source: 'paper1.pdf' }]);
+    expect('char_start' in result[0]).toBe(false);
+    expect('char_end' in result[0]).toBe(false);
+    expect('grounding_status' in result[0]).toBe(false);
+  });
+
   it('keeps both a text and a figure excerpt from the same array', () => {
     const result = parseExcerpts([
       { text: 'We propose Mamba...', source: 'paper1.pdf' },
