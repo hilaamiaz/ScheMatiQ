@@ -27,6 +27,7 @@ import pdfplumber
 import pytesseract
 from docx import Document
 from pdf2image import convert_from_path
+from pdfplumber.utils import cluster_objects
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,137 @@ def convert_docx_to_txt(input_path: Path, output_dir: Path) -> Tuple[bool, str]:
 
 _CHARS_PER_PAGE_THRESHOLD = 200
 
+# pdfplumber's default extract_text() reads a page in one top-to-bottom sweep
+# across the full page width. On a two-column layout this interleaves the two
+# columns word-by-word/line-by-line instead of reading one column fully
+# before the other, scrambling sentences that span the interleaving.
+# _detect_column_gutter/_extract_page_text_column_aware below detect a
+# genuine column gutter (a consistent vertical gap in word positions, not
+# just normal ragged-right word spacing) and, only when confident, read the
+# left column fully then the right column fully instead.
+
+_MIN_WORDS_FOR_COLUMN_DETECTION = 40
+_LINE_CLUSTER_TOLERANCE_PT = 3
+_MIN_RAW_GAP_PT = 12  # per-line candidate gap threshold (normal word spacing is ~2-3pt)
+_MIN_FINAL_GUTTER_WIDTH_PT = 8  # width required after intersecting the gap across lines
+_GUTTER_ZONE_FRACTION = (0.30, 0.70)  # gutter midpoint must fall in the page's middle band
+_MIN_GAP_HEIGHT_FRACTION = 0.55  # gap's vertical span / page height
+_MIN_GAP_LINE_FRACTION = 0.55  # lines-with-the-gap / lines-within-that-vertical-span
+_MIN_LINES_WITH_GAP = 8
+_MIN_SIDE_WORD_FRACTION = 0.15  # each side must hold a real share of the page's words
+_MIN_AVG_WORDS_PER_LINE_PER_SIDE = 3  # guards against two-column numeric tables
+
+
+def _detect_column_gutter(page: "pdfplumber.page.Page") -> Optional[Tuple[float, float]]:
+    """Return (gutter_x0, gutter_x1) if *page* has a confident two-column
+    layout, else None. A pure function of page geometry -- no I/O.
+    """
+    if getattr(page, "rotation", 0) not in (0, None):
+        return None  # rotated pages: x/top axes don't map to visual columns reliably
+
+    words = [w for w in page.extract_words() if w.get("upright", True)]
+    if len(words) < _MIN_WORDS_FOR_COLUMN_DETECTION:
+        return None
+
+    lines = cluster_objects(words, "top", _LINE_CLUSTER_TOLERANCE_PT)
+    lines = [sorted(line, key=lambda w: w["x0"]) for line in lines]
+    line_spans = [(min(w["top"] for w in line), max(w["bottom"] for w in line), line) for line in lines]
+
+    # Per-line candidate gaps wide enough, and roughly centered, to plausibly
+    # be a column gutter rather than ordinary word spacing.
+    candidates = []  # (x0, x1, top, bottom)
+    for top, bottom, line in line_spans:
+        for a, b in zip(line, line[1:]):
+            gap = b["x0"] - a["x1"]
+            if gap < _MIN_RAW_GAP_PT:
+                continue
+            mid_frac = ((a["x1"] + b["x0"]) / 2) / page.width
+            if _GUTTER_ZONE_FRACTION[0] <= mid_frac <= _GUTTER_ZONE_FRACTION[1]:
+                candidates.append((a["x1"], b["x0"], top, bottom))
+
+    if not candidates:
+        return None
+
+    # Merge candidates whose x-ranges mutually intersect, tracking the running
+    # intersection -- this is what narrows ragged-edge per-line gaps down to
+    # the one true, tight gutter shared across most lines.
+    candidates.sort(key=lambda c: c[0])
+    groups: list[dict] = []
+    for c in candidates:
+        merged = False
+        for g in groups:
+            new_x0, new_x1 = max(g["x0"], c[0]), min(g["x1"], c[1])
+            if new_x1 - new_x0 >= _MIN_FINAL_GUTTER_WIDTH_PT:
+                g.update(x0=new_x0, x1=new_x1, top=min(g["top"], c[2]),
+                         bottom=max(g["bottom"], c[3]), count=g["count"] + 1)
+                merged = True
+                break
+        if not merged:
+            groups.append({"x0": c[0], "x1": c[1], "top": c[2], "bottom": c[3], "count": 1})
+
+    if not groups:
+        return None
+    best = max(groups, key=lambda g: g["count"])
+
+    if best["x1"] - best["x0"] < _MIN_FINAL_GUTTER_WIDTH_PT:
+        return None
+    if best["count"] < _MIN_LINES_WITH_GAP:
+        return None
+    if (best["bottom"] - best["top"]) / page.height < _MIN_GAP_HEIGHT_FRACTION:
+        return None
+
+    lines_in_span = [ls for ls in line_spans
+                      if ls[0] >= best["top"] - 1 and ls[1] <= best["bottom"] + 1]
+    if not lines_in_span or best["count"] / len(lines_in_span) < _MIN_GAP_LINE_FRACTION:
+        return None
+
+    mid = (best["x0"] + best["x1"]) / 2
+
+    def _in_span(w: dict) -> bool:
+        return w["top"] >= best["top"] - 1 and w["bottom"] <= best["bottom"] + 1
+
+    left_words = [w for w in words if w["x1"] <= mid and _in_span(w)]
+    right_words = [w for w in words if w["x0"] >= mid and _in_span(w)]
+    total = len(left_words) + len(right_words)
+    if total == 0:
+        return None
+    if (len(left_words) / total < _MIN_SIDE_WORD_FRACTION
+            or len(right_words) / total < _MIN_SIDE_WORD_FRACTION):
+        return None
+
+    # Guard against two-column numeric tables (a wide gap but few words per
+    # line on each side).
+    n_lines = max(1, best["count"])
+    if (len(left_words) / n_lines < _MIN_AVG_WORDS_PER_LINE_PER_SIDE
+            or len(right_words) / n_lines < _MIN_AVG_WORDS_PER_LINE_PER_SIDE):
+        return None
+
+    return best["x0"], best["x1"]
+
+
+def _extract_page_text_column_aware(page: "pdfplumber.page.Page") -> str:
+    """Extract a page's text, reading a confidently-detected two-column page
+    column-major (full left column, then full right column) instead of
+    pdfplumber's default row-major sweep. Single-column pages -- and any page
+    where no confident column gutter is found -- are extracted exactly as
+    `page.extract_text()` would today.
+    """
+    gutter = _detect_column_gutter(page)
+    if gutter is None:
+        return page.extract_text() or ""
+
+    mid = (gutter[0] + gutter[1]) / 2
+    left = page.within_bbox((0, 0, mid, page.height)).extract_text() or ""
+    right = page.within_bbox((mid, 0, page.width, page.height)).extract_text() or ""
+
+    # Cheap RTL accommodation: if most words on the page are RTL-directed,
+    # the visually-first column is the right one.
+    words = page.extract_words()
+    if words and sum(1 for w in words if w.get("direction") == "rtl") / len(words) > 0.5:
+        left, right = right, left
+
+    return "\n\n".join(t for t in (left, right) if t)
+
 
 def convert_pdf_to_txt(input_path: Path, output_dir: Path) -> Tuple[bool, str]:
     """Convert a PDF to text via pdfplumber; fall back to OCR for scanned pages."""
@@ -155,7 +287,7 @@ def convert_pdf_to_txt(input_path: Path, output_dir: Path) -> Tuple[bool, str]:
 
     with pdfplumber.open(input_path) as pdf:
         page_count = max(1, len(pdf.pages))
-        text_parts = [p.extract_text() or "" for p in pdf.pages]
+        text_parts = [_extract_page_text_column_aware(p) for p in pdf.pages]
 
     total_chars = sum(len(t) for t in text_parts)
 

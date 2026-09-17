@@ -216,9 +216,7 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   );
 
   useEffect(() => {
-    if (process.env.NODE_ENV !== 'development') return;
     if (useInlineText && text && highlightTexts && highlightTexts.length > 0 && highlightRanges.length === 0) {
-      // eslint-disable-next-line no-console
       console.warn(
         '[DocumentPreview] No highlight match found for excerpt(s):',
         highlightTexts.map((e) => e.text),

@@ -164,18 +164,16 @@ function offsetRoughlyMatches(sourceSlice: string, excerptText: string): boolean
  */
 export function findHighlightRanges(
   text: string | null | undefined,
-  excerpts: ReadonlyArray<string | ExcerptLike | null | undefined> | null | undefined,
+  excerpts: ReadonlyArray<ExcerptLike | null | undefined> | null | undefined,
 ): Range[] {
   if (!text || !excerpts || excerpts.length === 0) return [];
 
   const found: Range[] = [];
   for (const exc of excerpts) {
-    if (!exc) continue;
-    const excerptText = typeof exc === 'string' ? exc : exc.text;
-    if (!excerptText) continue;
+    if (!exc || !exc.text) continue;
+    const excerptText = exc.text;
 
-    const start = typeof exc === 'object' ? exc.char_start : undefined;
-    const end = typeof exc === 'object' ? exc.char_end : undefined;
+    const { char_start: start, char_end: end } = exc;
     if (
       typeof start === 'number' && typeof end === 'number' &&
       start >= 0 && end > start && end <= text.length &&

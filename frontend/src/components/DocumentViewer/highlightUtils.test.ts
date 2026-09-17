@@ -58,18 +58,13 @@ describe('findHighlightRanges', () => {
     expect(text.slice(...ranges[0])).toBe('accuracy of 86.4 percent on');
   });
 
-  it('still accepts plain strings (backward compatible)', () => {
-    const ranges = findHighlightRanges(text, ['accuracy of 86.4 percent on']);
-    expect(ranges).toHaveLength(1);
-  });
-
   it('drops overlapping ranges, keeping the first', () => {
-    const ranges = findHighlightRanges(text, ['accuracy of', 'accuracy of 86.4 percent on']);
+    const ranges = findHighlightRanges(text, [{ text: 'accuracy of' }, { text: 'accuracy of 86.4 percent on' }]);
     expect(ranges).toHaveLength(1);
   });
 
   it('returns an empty array when text or excerpts are missing', () => {
-    expect(findHighlightRanges(null, ['x'])).toEqual([]);
+    expect(findHighlightRanges(null, [{ text: 'x' }])).toEqual([]);
     expect(findHighlightRanges(text, null)).toEqual([]);
     expect(findHighlightRanges(text, [])).toEqual([]);
   });

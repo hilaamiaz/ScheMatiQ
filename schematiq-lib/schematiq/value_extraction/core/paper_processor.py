@@ -197,6 +197,11 @@ class PaperProcessor:
         self.on_warning = on_warning
         # Schema evolution tracking: {column_name: {value: [list of documents]}}
         self.suggested_values: Dict[str, Dict[str, list]] = {}
+        # Corroboration tracking for allowed_values enforcement (see
+        # _enforceable_allowed_values): {column_name: {allowed_value: {documents}}}.
+        # Kept separate from suggested_values, which is reserved for
+        # genuinely novel values proposed for schema evolution.
+        self._allowed_value_confirmations: Dict[str, Dict[str, Set[str]]] = {}
         # Cache for fallback retriever (created on-demand, reused across papers)
         self._cached_fallback_retriever = None
         # Excerpt grounding for hallucination detection
@@ -525,6 +530,63 @@ class PaperProcessor:
                 ):
                     self.suggested_values[col_name][value].append(document_name)
 
+    def _enforceable_allowed_values(self, column: Column) -> List[str]:
+        """Subset of column.allowed_values corroborated by enough distinct
+        documents (column.auto_expand_threshold) to be safely enforced.
+
+        allowed_values is meant for genuinely categorical columns whose
+        values legitimately recur across documents (e.g. "graph_type":
+        bar chart/line plot/...). A freshly schema-discovered set is seeded
+        from whichever single document happened to be sampled during
+        discovery -- for a column that's actually open-ended/descriptive
+        (each document's real answer is unique), nothing else will ever
+        independently reproduce one of those values, and enforcing it onto
+        an unrelated document's answer silently replaces a correct,
+        document-grounded answer with borrowed text from a different
+        document's subject matter.
+
+        A value only becomes enforceable once corroborated by
+        `threshold - 1` OTHER documents beyond whichever one seeded it (see
+        _record_allowed_value_confirmations, which populates
+        self._allowed_value_confirmations from each document's own raw,
+        not-yet-enforced answer). A value that genuinely recurs across
+        documents earns enforcement automatically as those documents get
+        processed; a value that's actually specific to one document's
+        subject matter never accumulates a second independent occurrence
+        and is simply left as each document's own real answer.
+        """
+        if not column.allowed_values:
+            return []
+        threshold = column.auto_expand_threshold
+        if not threshold or threshold <= 1:
+            return column.allowed_values  # feature disabled -> today's behavior
+        confirmed = self._allowed_value_confirmations.get(column.name, {})
+        return [v for v in column.allowed_values if len(confirmed.get(v, ())) >= threshold - 1]
+
+    def _record_allowed_value_confirmations(
+        self, parsed: Dict[str, Any], columns: List[Column], document_name: str
+    ) -> None:
+        """Record, for each column with allowed_values, whether
+        *document_name*'s own raw answer independently matches one of them --
+        the corroboration signal _enforceable_allowed_values reads. Must run
+        with each column's FULL allowed_values (not the enforceable subset),
+        so a not-yet-trusted value can still accumulate corroboration.
+        """
+        for col in columns:
+            if not col.allowed_values:
+                continue
+            entry = parsed.get(col.name)
+            ans = entry.get("answer") if entry else None
+            if not isinstance(ans, str) or not ans.strip():
+                continue
+            matched_value, matched, _ = self.json_parser._normalize_to_allowed_values(
+                ans, col.allowed_values
+            )
+            if not matched:
+                continue
+            bucket = self._allowed_value_confirmations.setdefault(col.name, {})
+            bucket.setdefault(matched_value, set()).add(document_name)
+
     def get_suggested_values(self, threshold: int = 2) -> Dict[str, Dict[str, Any]]:
         """
         Return values that appear in threshold+ documents.
@@ -845,7 +907,7 @@ class PaperProcessor:
             parsed = self.json_parser.parse_response(raw)
             # Build allowed_values dict for postprocessing
             column_allowed_values = (
-                {col.name: col.allowed_values} if col.allowed_values else {}
+                {col.name: self._enforceable_allowed_values(col)} if col.allowed_values else {}
             )
             cleaned, unmatched = self.json_parser.postprocess(
                 parsed, [col.name], column_allowed_values
@@ -854,6 +916,7 @@ class PaperProcessor:
 
             # Track unmatched values for schema evolution
             self._track_unmatched_values(unmatched, paper_title)
+            self._record_allowed_value_confirmations(parsed, [col], paper_title)
 
             # Cache the result
             self.cache.put(cache_key, result)
@@ -956,7 +1019,7 @@ class PaperProcessor:
             requested = [c.name for c in columns]
             # Build allowed_values dict for postprocessing
             column_allowed_values = {
-                c.name: c.allowed_values for c in columns if c.allowed_values
+                c.name: self._enforceable_allowed_values(c) for c in columns if c.allowed_values
             }
             cleaned, unmatched = self.json_parser.postprocess(
                 parsed, requested, column_allowed_values
@@ -964,6 +1027,7 @@ class PaperProcessor:
 
             # Track unmatched values for schema evolution
             self._track_unmatched_values(unmatched, paper_title)
+            self._record_allowed_value_confirmations(parsed, columns, paper_title)
 
             debug_dumps.dump_llm_call(
                 pass_name="pass3_batch_fallback",
@@ -1076,7 +1140,7 @@ class PaperProcessor:
                         self.json_parser.parse_response(raw_re), key_map_re
                     )
                     reorder_allowed = {
-                        c.name: c.allowed_values
+                        c.name: self._enforceable_allowed_values(c)
                         for c in p2_batch
                         if c.allowed_values
                     }
@@ -1086,6 +1150,7 @@ class PaperProcessor:
                         reorder_allowed,
                     )
                     self._track_unmatched_values(unmatched_re, paper_title)
+                    self._record_allowed_value_confirmations(parsed_re, p2_batch, paper_title)
                     cleaned_re = self._attach_source_to_excerpts(
                         cleaned_re, paper_title
                     )
@@ -1323,7 +1388,7 @@ class PaperProcessor:
                 parsed = self._remap_response_keys(self.json_parser.parse_response(raw), key_map)
                 # Build allowed_values dict for postprocessing
                 column_allowed_values = (
-                    {col.name: col.allowed_values} if col.allowed_values else {}
+                    {col.name: self._enforceable_allowed_values(col)} if col.allowed_values else {}
                 )
                 cleaned, unmatched = self.json_parser.postprocess(
                     parsed, [col.name], column_allowed_values
@@ -1332,6 +1397,7 @@ class PaperProcessor:
 
                 # Track unmatched values for schema evolution
                 self._track_unmatched_values(unmatched, paper_title)
+                self._record_allowed_value_confirmations(parsed, [col], paper_title)
 
                 # Cache the result
                 self.cache.put(cache_key, result)
@@ -1410,7 +1476,7 @@ class PaperProcessor:
 
                 requested = [c.name for c in col_batch]
                 column_allowed_values = {
-                    c.name: c.allowed_values
+                    c.name: self._enforceable_allowed_values(c)
                     for c in col_batch
                     if c.allowed_values
                 }
@@ -1418,6 +1484,7 @@ class PaperProcessor:
                     parsed, requested, column_allowed_values
                 )
                 self._track_unmatched_values(unmatched, paper_title)
+                self._record_allowed_value_confirmations(parsed, col_batch, paper_title)
                 batch_cleaned = self._attach_source_to_excerpts(
                     batch_cleaned, paper_title
                 )
@@ -2110,7 +2177,7 @@ class PaperProcessor:
                 )
                 requested = [c.name for c in col_batch]
                 column_allowed_values = {
-                    c.name: c.allowed_values
+                    c.name: self._enforceable_allowed_values(c)
                     for c in col_batch
                     if c.allowed_values
                 }
@@ -2118,6 +2185,7 @@ class PaperProcessor:
                     parsed, requested, column_allowed_values
                 )
                 self._track_unmatched_values(unmatched, paper_title)
+                self._record_allowed_value_confirmations(parsed, col_batch, paper_title)
                 cleaned = self._attach_source_to_excerpts(cleaned, paper_title)
 
                 debug_dumps.dump_llm_call(

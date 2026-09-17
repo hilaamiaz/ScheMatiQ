@@ -355,7 +355,15 @@ class JSONResponseParser:
             normalized = False
             unmatched_original = None
             if col in column_allowed_values and column_allowed_values[col]:
+                original_ans = ans
                 ans, normalized, unmatched_original = self._normalize_to_allowed_values(ans, column_allowed_values[col])
+                # exs was written to support original_ans. A same-content match
+                # (e.g. only case/whitespace differs) still describes the same
+                # thing, so exs stays; a genuine content change (the fuzzy-match
+                # branch) means it no longer necessarily does -- drop it rather
+                # than pair a changed answer with a possibly-unrelated excerpt.
+                if normalized and original_ans.strip().lower() != ans.strip().lower():
+                    exs = []
 
             out[col] = {"answer": ans, "excerpts": exs}
             if figs:
