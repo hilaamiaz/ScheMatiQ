@@ -201,6 +201,23 @@ class PaperProcessor:
         # _enforceable_allowed_values): {column_name: {allowed_value: {documents}}}.
         # Kept separate from suggested_values, which is reserved for
         # genuinely novel values proposed for schema evolution.
+        #
+        # Concurrency note (see _load_document_figures's docstring for the
+        # established pattern this follows): extract_values_for_paper --
+        # which reads and writes this dict via _enforceable_allowed_values/
+        # _record_allowed_value_confirmations -- is reachable through
+        # TableBuilder's ThreadPoolExecutor path (process_single_paper), so
+        # multiple documents can mutate this SAME dict/set concurrently from
+        # different worker threads. Unlike _active_figure_images, this is
+        # safe from corruption: every mutation here is a plain dict/set
+        # setdefault/add, atomic under the GIL. The only real consequence of
+        # a race is staleness -- two documents in flight at the same moment
+        # each see a snapshot that doesn't yet include the other's answer,
+        # so a value both would have corroborated together might not be
+        # enforced until a later document confirms it. That degrades
+        # gracefully (worst case: enforcement kicks in a bit later than
+        # ideal) and never re-introduces the original bug (an unrelated
+        # document's answer getting force-replaced), so no lock is used.
         self._allowed_value_confirmations: Dict[str, Dict[str, Set[str]]] = {}
         # Cache for fallback retriever (created on-demand, reused across papers)
         self._cached_fallback_retriever = None
@@ -560,6 +577,8 @@ class PaperProcessor:
         threshold = column.auto_expand_threshold
         if not threshold or threshold <= 1:
             return column.allowed_values  # feature disabled -> today's behavior
+        if self.json_parser.is_type_constraint(column.allowed_values):
+            return column.allowed_values  # format rule, not a borrowed-content risk
         confirmed = self._allowed_value_confirmations.get(column.name, {})
         return [v for v in column.allowed_values if len(confirmed.get(v, ())) >= threshold - 1]
 
@@ -573,16 +592,14 @@ class PaperProcessor:
         so a not-yet-trusted value can still accumulate corroboration.
         """
         for col in columns:
-            if not col.allowed_values:
+            if not col.allowed_values or self.json_parser.is_type_constraint(col.allowed_values):
                 continue
             entry = parsed.get(col.name)
             ans = entry.get("answer") if entry else None
             if not isinstance(ans, str) or not ans.strip():
                 continue
-            matched_value, matched, _ = self.json_parser._normalize_to_allowed_values(
-                ans, col.allowed_values
-            )
-            if not matched:
+            matched_value = self.json_parser.matches_allowed_value(ans, col.allowed_values)
+            if matched_value is None:
                 continue
             bucket = self._allowed_value_confirmations.setdefault(col.name, {})
             bucket.setdefault(matched_value, set()).add(document_name)

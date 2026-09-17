@@ -47,6 +47,20 @@ describe('findHighlightRanges', () => {
     expect(text.slice(...ranges[0])).toBe('accuracy of 86.4 percent on');
   });
 
+  it('uses the offset even when the excerpt text carries a surrounding quote', () => {
+    // Excerpts routinely arrive quote-wrapped, and this one is ALSO a
+    // paraphrase ("86.4%" vs "86.4 percent") that findHighlightRange can
+    // never locate on its own (proven in the earlier test above) -- so
+    // this only passes if the offset path itself tolerates the leading
+    // quote when checking "does this offset look right."
+    const start = text.indexOf('accuracy of 86.4 percent on');
+    const end = start + 'accuracy of 86.4 percent on'.length;
+    const ranges = findHighlightRanges(text, [
+      { text: '"accuracy of 86.4% on MMLU', char_start: start, char_end: end },
+    ]);
+    expect(ranges).toEqual([[start, end]]);
+  });
+
   it('falls back to text search when the offset points at unrelated text (stale offset guard)', () => {
     // char_start/char_end are in-range but point at "Intro." while the
     // excerpt text is about something else entirely -- the first-word sanity

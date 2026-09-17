@@ -159,6 +159,49 @@ def build_mixed_layout_pdf(
     c.save()
 
 
+def build_two_column_with_full_width_line_pdf(
+    path: Path,
+    left_text: str,
+    right_text: str,
+    full_width_line: str,
+    *,
+    page_size=letter,
+) -> None:
+    """A two-column page with one line, partway down, that spans the FULL
+    page width (a caption/table-row/equation straddling the gutter) --
+    exercises the guard against silently dropping that line's text."""
+    width, height = page_size
+    left_x, right_x = 50, width / 2 + 15
+    col_width = width / 2 - 65
+
+    c = Canvas(str(path), pagesize=page_size)
+    c.setFont(_FONT_NAME, _FONT_SIZE)
+    left_lines = _wrapped_lines(left_text, col_width)
+    right_lines = _wrapped_lines(right_text, col_width)
+    mid_row = len(left_lines) // 2
+
+    y = height - _TOP_MARGIN
+    for i, line in enumerate(left_lines):
+        if y < _BOTTOM_MARGIN:
+            break
+        if i == mid_row:
+            c.drawString(left_x, y, full_width_line)
+        else:
+            c.drawString(left_x, y, line)
+        y -= _LINE_HEIGHT
+
+    y = height - _TOP_MARGIN
+    for i, line in enumerate(right_lines):
+        if y < _BOTTOM_MARGIN:
+            break
+        if i != mid_row:  # the full-width line already occupies this row
+            c.drawString(right_x, y, line)
+        y -= _LINE_HEIGHT
+
+    c.showPage()
+    c.save()
+
+
 def build_sparse_pdf(path: Path, text: str = "Hi.", *, page_size=letter) -> None:
     """A near-blank page with only a couple of words."""
     c = Canvas(str(path), pagesize=page_size)

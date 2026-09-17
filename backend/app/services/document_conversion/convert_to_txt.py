@@ -176,6 +176,8 @@ def _detect_column_gutter(page: "pdfplumber.page.Page") -> Optional[Tuple[float,
     """
     if getattr(page, "rotation", 0) not in (0, None):
         return None  # rotated pages: x/top axes don't map to visual columns reliably
+    if not page.width or not page.height:
+        return None  # degenerate/malformed page geometry -- nothing safe to measure
 
     words = [w for w in page.extract_words() if w.get("upright", True)]
     if len(words) < _MIN_WORDS_FOR_COLUMN_DETECTION:
@@ -254,6 +256,16 @@ def _detect_column_gutter(page: "pdfplumber.page.Page") -> Optional[Tuple[float,
             or len(right_words) / n_lines < _MIN_AVG_WORDS_PER_LINE_PER_SIDE):
         return None
 
+    # _MIN_GAP_LINE_FRACTION tolerates some lines within the gutter's
+    # vertical span not having the gap -- but a line that's genuinely
+    # full-width (a caption, table row, or equation spanning the whole
+    # page) has a word straddling `mid` itself. within_bbox only keeps
+    # objects FULLY inside a bbox, so such a word would fall in neither the
+    # left nor the right crop and be silently dropped from the output. Bail
+    # out to today's plain extract_text() rather than lose text.
+    if any(w["x0"] < mid < w["x1"] for w in words if _in_span(w)):
+        return None
+
     return best["x0"], best["x1"]
 
 
@@ -263,22 +275,30 @@ def _extract_page_text_column_aware(page: "pdfplumber.page.Page") -> str:
     pdfplumber's default row-major sweep. Single-column pages -- and any page
     where no confident column gutter is found -- are extracted exactly as
     `page.extract_text()` would today.
+
+    Column detection and splitting run on arbitrary, uncontrolled real-world
+    PDFs (malformed fonts/encodings, degenerate geometry); any unexpected
+    failure there falls back to today's plain extraction rather than
+    failing the whole document's conversion.
     """
-    gutter = _detect_column_gutter(page)
-    if gutter is None:
+    try:
+        gutter = _detect_column_gutter(page)
+        if gutter is None:
+            return page.extract_text() or ""
+
+        mid = (gutter[0] + gutter[1]) / 2
+        left = page.within_bbox((0, 0, mid, page.height)).extract_text() or ""
+        right = page.within_bbox((mid, 0, page.width, page.height)).extract_text() or ""
+
+        # Cheap RTL accommodation: if most words on the page are RTL-directed,
+        # the visually-first column is the right one.
+        words = page.extract_words()
+        if words and sum(1 for w in words if w.get("direction") == "rtl") / len(words) > 0.5:
+            left, right = right, left
+
+        return "\n\n".join(t for t in (left, right) if t)
+    except Exception:
         return page.extract_text() or ""
-
-    mid = (gutter[0] + gutter[1]) / 2
-    left = page.within_bbox((0, 0, mid, page.height)).extract_text() or ""
-    right = page.within_bbox((mid, 0, page.width, page.height)).extract_text() or ""
-
-    # Cheap RTL accommodation: if most words on the page are RTL-directed,
-    # the visually-first column is the right one.
-    words = page.extract_words()
-    if words and sum(1 for w in words if w.get("direction") == "rtl") / len(words) > 0.5:
-        left, right = right, left
-
-    return "\n\n".join(t for t in (left, right) if t)
 
 
 def convert_pdf_to_txt(input_path: Path, output_dir: Path) -> Tuple[bool, str]:

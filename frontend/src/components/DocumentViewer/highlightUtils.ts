@@ -143,10 +143,15 @@ function firstWord(s: string): string {
  * on disk was ever replaced. Deliberately loose (first word only, not a full
  * comparison): the backend's own fuzzy grounding can legitimately diverge
  * from the excerpt's exact wording past the first word.
+ *
+ * Both sides are run through cleanQuery first: excerpts routinely carry a
+ * surrounding quote (see this file's module docstring) that would otherwise
+ * stick to the first word (e.g. `"the` vs `the`) and make a perfectly valid
+ * backend-computed offset fail this check every time.
  */
 function offsetRoughlyMatches(sourceSlice: string, excerptText: string): boolean {
-  const a = firstWord(sourceSlice);
-  const b = firstWord(excerptText);
+  const a = firstWord(cleanQuery(sourceSlice));
+  const b = firstWord(cleanQuery(excerptText));
   return a.length > 0 && a === b;
 }
 

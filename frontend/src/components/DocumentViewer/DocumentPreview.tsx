@@ -180,11 +180,21 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   // (e.g. a raw PDF whose conversion failed). Detect that and fall back to the
   // native iframe instead of rendering raw bytes as gibberish.
   const [contentIsBinary, setContentIsBinary] = useState(false);
+  // Which documentName `text` was actually fetched for. `text` is cleared by
+  // this same effect on a documentName change, but only on the NEXT effect
+  // pass -- for one render, `text` can still hold the PREVIOUS document's
+  // content while `highlightTexts` (a prop, updated in the same render as
+  // the new documentName) already reflects the new selection. Comparing
+  // against this ref -- set synchronously, so it's already up to date by
+  // the time the warning effect below runs in the same commit -- stops that
+  // transient mismatch from firing a false "no highlight found" warning.
+  const textDocumentRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!useInlineText || !sessionId || !documentName || availability !== 'ok') {
       setText(null);
       setTextError(false);
+      textDocumentRef.current = null;
       setContentIsBinary(false);
       return undefined;
     }
@@ -192,6 +202,7 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
     setText(null);
     setTextError(false);
     setContentIsBinary(false);
+    textDocumentRef.current = null;
     unitsAPI
       .getDocumentContentText(sessionId, documentName)
       .then((content) => {
@@ -200,6 +211,7 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
           setContentIsBinary(true);
         } else {
           setText(content);
+          textDocumentRef.current = documentName;
         }
       })
       .catch(() => {
@@ -216,13 +228,23 @@ const DocumentPreview: React.FC<DocumentPreviewProps> = ({
   );
 
   useEffect(() => {
-    if (useInlineText && text && highlightTexts && highlightTexts.length > 0 && highlightRanges.length === 0) {
+    // textDocumentRef guards against a transient one-render mismatch: on a
+    // documentName change, highlightTexts (a prop) already reflects the new
+    // selection, but `text` can still hold the PREVIOUS document's content
+    // until the fetch effect above clears it. Without this check, that
+    // stale combination would spuriously warn about excerpts that are
+    // perfectly fine once the correct document's text loads.
+    const textMatchesCurrentDocument = textDocumentRef.current === documentName;
+    if (
+      useInlineText && text && textMatchesCurrentDocument &&
+      highlightTexts && highlightTexts.length > 0 && highlightRanges.length === 0
+    ) {
       console.warn(
         '[DocumentPreview] No highlight match found for excerpt(s):',
         highlightTexts.map((e) => e.text),
       );
     }
-  }, [useInlineText, text, highlightTexts, highlightRanges]);
+  }, [useInlineText, text, documentName, highlightTexts, highlightRanges]);
 
   const firstMarkRef = useRef<HTMLElement | null>(null);
   useEffect(() => {

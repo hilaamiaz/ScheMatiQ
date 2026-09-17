@@ -296,6 +296,42 @@ class JSONResponseParser:
         # No match - keep original (soft enforcement) and flag for schema evolution
         return answer, False, answer
 
+    def is_type_constraint(self, allowed_values: List[str]) -> bool:
+        """True if allowed_values is a single-item TYPE/format constraint
+        (date / date:... / number / a min-max range) rather than a literal
+        set of categorical values -- mirrors _normalize_to_allowed_values's
+        single-item branch above. A caller deciding whether to gate
+        enforcement on multi-document corroboration should treat this case
+        specially: corroboration only makes sense for genuine categorical
+        values that might have been borrowed from an unrelated document.
+        A type constraint is a structural format rule the schema itself
+        declared, not content, so it should always apply -- and in fact
+        can never accumulate corroboration under the same key, since
+        _normalize_to_allowed_values returns the ANSWER's own parsed/
+        clamped value (e.g. "100.0"), never the literal constraint token
+        ("number"/"0-100"/"date"), so treating it like a categorical value
+        would silently disable it forever.
+        """
+        if len(allowed_values) != 1:
+            return False
+        raw = allowed_values[0].strip()
+        if self._strftime_format_from_date_constraint(raw) is not None:
+            return True
+        if raw.lower() == "number":
+            return True
+        return self._parse_numeric_range(raw.lower()) is not None
+
+    def matches_allowed_value(self, answer: str, allowed_values: List[str]) -> Optional[str]:
+        """Public read-only check: does *answer* match one of allowed_values
+        (same exact/case-insensitive/fuzzy rules postprocess's soft
+        enforcement uses)? Returns the canonical matched value, or None --
+        callers that only need to know "would this match," without applying
+        the replacement postprocess does, should use this instead of
+        reaching into _normalize_to_allowed_values directly.
+        """
+        matched_value, matched, _ = self._normalize_to_allowed_values(answer, allowed_values)
+        return matched_value if matched else None
+
     def postprocess(
         self,
         parsed: Dict[str, Dict[str, Any]],

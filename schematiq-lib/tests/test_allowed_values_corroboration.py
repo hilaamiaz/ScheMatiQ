@@ -89,6 +89,31 @@ class TestEnforceableAllowedValues:
         column = FakeColumn(name="col", allowed_values=None)
         assert _enforceable(s, column) == []
 
+    def test_type_constraints_are_always_enforceable_not_gated(self):
+        """A single-item allowed_values list is a TYPE/format constraint
+        (date/number/min-max range) in _normalize_to_allowed_values, not a
+        categorical value -- it must never be gated behind corroboration,
+        since _record_allowed_value_confirmations records the ANSWER's own
+        parsed value (e.g. "100.0"), never the literal constraint token
+        ("0-100"), so a gated type constraint could never accumulate enough
+        corroboration to become enforceable and would stay permanently
+        disabled."""
+        s = FakeSelf()
+        for allowed in (["0-100"], ["number"], ["date"], ["date:us"]):
+            column = FakeColumn(name="col", allowed_values=allowed)
+            assert _enforceable(s, column) == allowed, allowed
+
+    def test_record_confirmations_skips_type_constraint_columns(self):
+        """Recording should not create noise entries for type-constraint
+        columns -- there's no categorical value there to corroborate."""
+        s = FakeSelf()
+        column = FakeColumn(name="accuracy_pct", allowed_values=["0-100"])
+        parsed = {"accuracy_pct": {"answer": "142", "excerpts": []}}
+
+        _record(s, parsed, [column], "doc1")
+
+        assert s._allowed_value_confirmations == {}
+
 
 class TestRecordAllowedValueConfirmations:
     def test_matching_answer_recorded_under_canonical_value(self):
@@ -121,6 +146,21 @@ class TestRecordAllowedValueConfirmations:
         _record(s, parsed, [column], "doc1")
 
         assert s._allowed_value_confirmations == {}
+
+
+class TestTypeConstraintEndToEnd:
+    def test_numeric_range_clamps_from_the_first_document(self):
+        """A numeric-range constraint must clamp immediately -- it's a
+        format rule declared by the schema itself, not a value borrowed
+        from another document, so it must not wait for corroboration."""
+        s = FakeSelf()
+        column = FakeColumn(name="accuracy_pct", allowed_values=["0-100"])
+
+        enforceable = PaperProcessor._enforceable_allowed_values(s, column)
+        parsed = {column.name: {"answer": "142", "excerpts": [{"text": "142%", "source": "doc1"}]}}
+        out, _ = s.json_parser.postprocess(parsed, [column.name], {column.name: enforceable})
+
+        assert out[column.name]["answer"] == "100.0"
 
 
 class TestEndToEndCrossDocumentContamination:

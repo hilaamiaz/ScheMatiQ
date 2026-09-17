@@ -939,8 +939,8 @@ function Workspace() {
   // parsed on a given render.
   const handleGroundingHighlight = useCallback((excerpts: TextExcerpt[] | null) => {
     setGroundingHighlights((current) => {
-      const currentKey = JSON.stringify((current ?? []).map((e) => [e.text, e.char_start ?? null]));
-      const nextKey = JSON.stringify((excerpts ?? []).map((e) => [e.text, e.char_start ?? null]));
+      const currentKey = JSON.stringify((current ?? []).map((e) => [e.text, e.char_start ?? null, e.char_end ?? null]));
+      const nextKey = JSON.stringify((excerpts ?? []).map((e) => [e.text, e.char_start ?? null, e.char_end ?? null]));
       return currentKey === nextKey ? current : excerpts;
     });
   }, []);
