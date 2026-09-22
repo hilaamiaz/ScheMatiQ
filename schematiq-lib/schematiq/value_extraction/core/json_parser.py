@@ -312,7 +312,7 @@ class JSONResponseParser:
         ("number"/"0-100"/"date"), so treating it like a categorical value
         would silently disable it forever.
         """
-        if len(allowed_values) != 1:
+        if not allowed_values or len(allowed_values) != 1 or not isinstance(allowed_values[0], str):
             return False
         raw = allowed_values[0].strip()
         if self._strftime_format_from_date_constraint(raw) is not None:
@@ -328,7 +328,14 @@ class JSONResponseParser:
         callers that only need to know "would this match," without applying
         the replacement postprocess does, should use this instead of
         reaching into _normalize_to_allowed_values directly.
+
+        Defensively typed at this public boundary (unlike the private
+        method it wraps, which trusts postprocess's own upstream
+        None/type/placeholder checks): a non-string answer or falsy
+        allowed_values just means "no match" rather than an AttributeError.
         """
+        if not isinstance(answer, str) or not allowed_values:
+            return None
         matched_value, matched, _ = self._normalize_to_allowed_values(answer, allowed_values)
         return matched_value if matched else None
 
@@ -391,15 +398,19 @@ class JSONResponseParser:
             normalized = False
             unmatched_original = None
             if col in column_allowed_values and column_allowed_values[col]:
-                original_ans = ans
+                # Deliberately does NOT clear/replace exs when normalization
+                # changes ans's content, even though exs was written to
+                # support the pre-normalization answer: exs is verified for
+                # real downstream, in _ground_and_enforce (paper_processor.py),
+                # which nulls the WHOLE answer if excerpts end up empty and
+                # this context isn't vision-derived -- so clearing a real,
+                # source-grounded excerpt here (tried once; see git history)
+                # doesn't trade "answer paired with an imperfect citation" for
+                # "answer paired with no citation," it trades it for "answer
+                # gone entirely," which is worse. Leaving exs as the model's
+                # own real excerpt lets _ground_and_enforce's actual
+                # source-text verification decide its fate instead.
                 ans, normalized, unmatched_original = self._normalize_to_allowed_values(ans, column_allowed_values[col])
-                # exs was written to support original_ans. A same-content match
-                # (e.g. only case/whitespace differs) still describes the same
-                # thing, so exs stays; a genuine content change (the fuzzy-match
-                # branch) means it no longer necessarily does -- drop it rather
-                # than pair a changed answer with a possibly-unrelated excerpt.
-                if normalized and original_ans.strip().lower() != ans.strip().lower():
-                    exs = []
 
             out[col] = {"answer": ans, "excerpts": exs}
             if figs:

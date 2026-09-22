@@ -298,6 +298,12 @@ def _extract_page_text_column_aware(page: "pdfplumber.page.Page") -> str:
 
         return "\n\n".join(t for t in (left, right) if t)
     except Exception:
+        # Silent-but-observable: falling back here is always safe (today's
+        # exact behavior), but silently swallowing every exception with no
+        # trace at all would let a real regression in the detection logic
+        # run at effectively 100% failure rate, forever, with no signal
+        # that the column-aware path is even being exercised.
+        logger.debug("Column-aware extraction failed, falling back to plain extract_text()", exc_info=True)
         return page.extract_text() or ""
 
 

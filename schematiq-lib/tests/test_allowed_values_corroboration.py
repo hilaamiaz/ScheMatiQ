@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set
 
 from schematiq.value_extraction.core.json_parser import JSONResponseParser
 from schematiq.value_extraction.core.paper_processor import PaperProcessor
+from schematiq.value_extraction.utils.excerpt_grounder import ExcerptGrounder
 
 
 @dataclass
@@ -161,6 +162,55 @@ class TestTypeConstraintEndToEnd:
         out, _ = s.json_parser.postprocess(parsed, [column.name], {column.name: enforceable})
 
         assert out[column.name]["answer"] == "100.0"
+
+
+class TestNormalizationDoesNotInteractBadlyWithGroundAndEnforce:
+    """Regression test for a real interaction bug: postprocess previously
+    cleared an excerpt whenever normalization changed the answer's content
+    (to avoid pairing a changed answer with a possibly-unrelated excerpt).
+    But paper_processor.py's _ground_and_enforce -- called right after
+    postprocess for any non-vision-derived unit -- nulls the WHOLE answer
+    whenever its excerpts end up empty ("claims an answer with no excerpts
+    at all"). So clearing a real, source-grounded excerpt didn't just lose
+    the citation, it silently deleted the entire answer. postprocess must
+    leave the excerpt in place and let _ground_and_enforce's own
+    source-text verification decide its fate.
+    """
+
+    def test_fuzzy_normalized_answer_with_a_real_excerpt_survives_ground_and_enforce(self):
+        s = FakeSelf()
+        s.excerpt_grounder = ExcerptGrounder()
+        s._active_figure_images = []  # non-vision path -- _ground_and_enforce runs fully
+
+        allowed = ["accuracy of 86.4 percent on the MMLU benchmark for large models"]
+        column = FakeColumn(name="key_finding", allowed_values=allowed)
+        s._allowed_value_confirmations["key_finding"] = {allowed[0]: {"doc1"}}  # already corroborated
+
+        source_text = (
+            "In our experiments we report accuracy of 86.4 percent on the "
+            "MMLU benchmark for large models, a strong result."
+        )
+        real_excerpt_text = "accuracy of 86.4 percent on the MMLU benchmark for large models"
+        parsed = {
+            column.name: {
+                "answer": "accuracy of 86.4% on MMLU benchmark for large models",
+                "excerpts": [{"text": real_excerpt_text, "source": "doc2"}],
+            }
+        }
+
+        enforceable = PaperProcessor._enforceable_allowed_values(s, column)
+        cleaned, _ = s.json_parser.postprocess(parsed, [column.name], {column.name: enforceable})
+        # Confirm normalization actually fired (the interaction only exists
+        # when it does) before checking the survival property below.
+        assert cleaned[column.name]["answer"] == allowed[0]
+        assert cleaned[column.name].get("normalized_to_allowed") is True
+
+        result = PaperProcessor._ground_and_enforce(s, cleaned, source_text, "doc2")
+
+        assert result[column.name]["answer"] is not None, (
+            "a normalized answer with a real, source-grounded excerpt must not be nulled"
+        )
+        assert result[column.name]["excerpts"], "the real excerpt must survive"
 
 
 class TestEndToEndCrossDocumentContamination:

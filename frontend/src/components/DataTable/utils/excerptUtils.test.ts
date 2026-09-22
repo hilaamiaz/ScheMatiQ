@@ -67,6 +67,16 @@ describe('parseExcerpts', () => {
     ]);
   });
 
+  it('rejects an unrecognized grounding_status value instead of trusting it blindly', () => {
+    // grounding_status comes straight from an external payload -- an `as`
+    // cast alone would let ANY string through as if it were one of the 4
+    // known literals. Validate it instead of lying to the type system.
+    const result = parseExcerpts([
+      { text: 'We propose Mamba...', source: 'paper1.pdf', grounding_status: 'some_future_status' },
+    ]);
+    expect('grounding_status' in result[0]).toBe(false);
+  });
+
   it('omits grounding offset fields when absent rather than inventing them', () => {
     const result = parseExcerpts([{ text: 'We propose Mamba...', source: 'paper1.pdf' }]);
     expect('char_start' in result[0]).toBe(false);

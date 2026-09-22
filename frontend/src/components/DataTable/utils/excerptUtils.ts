@@ -7,6 +7,17 @@ import { extractDisplayValue, parsePythonString } from './valueUtils';
 // `excerpt.type === 'figure'` before assuming `.text` exists.
 export type ParsedExcerpt = TextExcerpt | FigureExcerpt;
 
+const GROUNDING_STATUSES = new Set<TextExcerpt['grounding_status']>([
+  'exact', 'case_insensitive', 'fuzzy', 'not_found',
+]);
+
+/** Runtime type guard for TextExcerpt['grounding_status'] -- an `as` cast
+ *  alone would let any string through unchecked, silently lying to the
+ *  type system about a value that came straight from an external payload. */
+function isGroundingStatus(value: unknown): value is TextExcerpt['grounding_status'] {
+  return typeof value === 'string' && GROUNDING_STATUSES.has(value as TextExcerpt['grounding_status']);
+}
+
 /**
  * Parse pipe-separated excerpt strings like: {'text': '...', 'source': '...'} | {'text': '...'}
  * Figure-typed objects (`{type: 'figure', figure_id, ...}`) are passed through
@@ -51,9 +62,7 @@ export function parseExcerpts(excerpts: unknown[]): ParsedExcerpt[] {
           source: String(obj.source || `Source ${result.length + 1}`),
           ...(typeof obj.char_start === 'number' ? { char_start: obj.char_start } : {}),
           ...(typeof obj.char_end === 'number' ? { char_end: obj.char_end } : {}),
-          ...(typeof obj.grounding_status === 'string'
-            ? { grounding_status: obj.grounding_status as TextExcerpt['grounding_status'] }
-            : {}),
+          ...(isGroundingStatus(obj.grounding_status) ? { grounding_status: obj.grounding_status } : {}),
         });
       }
     }
