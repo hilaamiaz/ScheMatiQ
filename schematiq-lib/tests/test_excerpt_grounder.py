@@ -131,3 +131,55 @@ class TestGroundAllExcerpts:
     def test_empty_extraction(self):
         stats = self.grounder.ground_all_excerpts({}, "some source text")
         assert stats == {"exact": 0, "case_insensitive": 0, "fuzzy": 0, "not_found": 0}
+
+    def test_duplicate_excerpt_text_resolves_to_different_occurrences(self):
+        """Two different columns citing the identical phrase, which really
+        appears twice in the source, must not both collapse onto the
+        document's first occurrence."""
+        source = (
+            "Results showed wild-type vs ST3Gal-I deficient mice differed. "
+            "Figure 2 legend: wild-type vs ST3Gal-I deficient comparison shown."
+        )
+        result = {
+            "finding_1": {
+                "answer": "difference observed",
+                "excerpts": ["wild-type vs ST3Gal-I deficient"],
+            },
+            "finding_2": {
+                "answer": "figure comparison",
+                "excerpts": ["wild-type vs ST3Gal-I deficient"],
+            },
+        }
+        self.grounder.ground_all_excerpts(result, source)
+        first_start = result["finding_1"]["excerpts"][0]["char_start"]
+        second_start = result["finding_2"]["excerpts"][0]["char_start"]
+        assert first_start is not None and second_start is not None
+        assert first_start != second_start
+        assert first_start == source.index("wild-type vs ST3Gal-I deficient")
+        assert second_start == source.rindex("wild-type vs ST3Gal-I deficient")
+
+    def test_duplicate_excerpt_more_repeats_than_occurrences_falls_back(self):
+        """A third identical-text excerpt, with no remaining occurrence left
+        to claim, still grounds to a real position instead of not_found."""
+        source = "The gene was upregulated in the treated group. The treated group showed changes."
+        result = {
+            "col_a": {"answer": "a", "excerpts": ["the treated group"]},
+            "col_b": {"answer": "b", "excerpts": ["the treated group"]},
+            "col_c": {"answer": "c", "excerpts": ["the treated group"]},
+        }
+        stats = self.grounder.ground_all_excerpts(result, source)
+        assert stats["not_found"] == 0
+        for col in ("col_a", "col_b", "col_c"):
+            exc = result[col]["excerpts"][0]
+            assert exc["grounding_status"] != "not_found"
+            assert exc["char_start"] is not None
+
+    def test_short_excerpt_with_irregular_spacing_still_grounds(self):
+        """A short (<3-word) excerpt that only differs from the source by
+        whitespace can't reach the fuzzy phase (which requires >= 3 words),
+        so it needs the whitespace-normalized phase to ground at all."""
+        source = "The comparison of ST3Gal-I  deficient mice was notable."
+        start, end, status = self.grounder.ground_excerpt("ST3Gal-I deficient", source)
+        assert status != "not_found"
+        assert start is not None and end is not None
+        assert source[start:end] == "ST3Gal-I  deficient"
