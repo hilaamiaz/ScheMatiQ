@@ -252,3 +252,101 @@ def build_sparse_pdf(path: Path, text: str = "Hi.", *, page_size=letter) -> None
     c.drawString(72, page_size[1] - 72, text)
     c.showPage()
     c.save()
+
+
+def _draw_words_glued(
+    c: Canvas,
+    words: list[str],
+    x0: float,
+    max_x: float,
+    y0: float,
+    *,
+    inter_word_gap: float,
+    space_every_n_words: int | None = None,
+) -> None:
+    """Draw `words` left-to-right via individual `drawString` calls, cursor
+    advanced by each word's rendered width plus `inter_word_gap` points --
+    with NO literal space character placed in the content stream, EXCEPT:
+    when `space_every_n_words` is set, every Nth word is joined to the word
+    that follows it with a real ' ' character inside the same `drawString`
+    call, producing a fixture with a realistic sparse-but-nonzero space
+    ratio (real glued documents aren't uniformly glued -- occasional runs
+    keep literal spaces) instead of the default's strict all-or-nothing 0%.
+    Wraps to a new line when a chunk would cross `max_x`.
+    """
+    x, y = x0, y0
+    i, count, n = 0, 0, len(words)
+    while i < n:
+        chunk = words[i]
+        i += 1
+        if space_every_n_words and count > 0 and count % space_every_n_words == 0 and i < n:
+            chunk = chunk + " " + words[i]
+            i += 1
+        count += 1
+        chunk_width = c.stringWidth(chunk, _FONT_NAME, _FONT_SIZE)
+        if x > x0 and x + chunk_width > max_x:
+            x, y = x0, y - _LINE_HEIGHT
+            if y < _BOTTOM_MARGIN:
+                break
+        c.drawString(x, y, chunk)
+        x += chunk_width + inter_word_gap
+
+
+def build_glued_word_pdf(
+    path: Path,
+    words: list[str],
+    *,
+    inter_word_gap: float = 1.2,
+    space_every_n_words: int | None = None,
+    page_size=letter,
+) -> None:
+    """A page where every word is drawn via its own `drawString` call,
+    positioned edge-to-edge plus a small explicit `inter_word_gap` pt --
+    with no literal space character anywhere in the content stream (unless
+    `space_every_n_words` is set -- see `_draw_words_glued`).
+    Reproduces PDF producers that place words via pure glyph positioning
+    (observed on certain Cell Press/Elsevier exports), which is the
+    precondition for pdfplumber's default x_tolerance=3 to glue adjacent
+    words together whenever the true gap is smaller than that.
+    """
+    width, height = page_size
+    x_margin, max_x = 72, width - 72
+    c = Canvas(str(path), pagesize=page_size)
+    c.setFont(_FONT_NAME, _FONT_SIZE)
+    _draw_words_glued(
+        c,
+        words,
+        x_margin,
+        max_x,
+        height - _TOP_MARGIN,
+        inter_word_gap=inter_word_gap,
+        space_every_n_words=space_every_n_words,
+    )
+    c.showPage()
+    c.save()
+
+
+def build_two_column_glued_pdf(
+    path: Path,
+    left_words: list[str],
+    right_words: list[str],
+    *,
+    inter_word_gap: float = 1.2,
+    page_size=letter,
+) -> None:
+    """A genuine two-column page where words within each column are placed
+    via `drawString` with no literal space glyphs -- exercises composition
+    of the column-gutter detection with the word-gap-derived tolerance fix.
+    Uses the same column geometry as `build_two_column_pdf`.
+    """
+    width, height = page_size
+    left_x, right_x = 50, width / 2 + 15
+    max_left_x, max_right_x = width / 2 - 15, width - 50
+
+    c = Canvas(str(path), pagesize=page_size)
+    c.setFont(_FONT_NAME, _FONT_SIZE)
+    y0 = height - _TOP_MARGIN
+    _draw_words_glued(c, left_words, left_x, max_left_x, y0, inter_word_gap=inter_word_gap)
+    _draw_words_glued(c, right_words, right_x, max_right_x, y0, inter_word_gap=inter_word_gap)
+    c.showPage()
+    c.save()

@@ -21,13 +21,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import pdfplumber
 import pytesseract
 from docx import Document
 from pdf2image import convert_from_path
-from pdfplumber.utils import cluster_objects
+from pdfplumber.utils import DEFAULT_X_TOLERANCE, cluster_objects
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +183,47 @@ _MIN_SIDE_WORD_FRACTION = 0.15  # each side must hold a real share of the page's
 # column, comfortably above a numeric table's ~1.
 _MIN_AVG_WORDS_PER_LINE_PER_SIDE = 2
 
+# ---------------------------------------------------------------------------
+# Missing-literal-space-glyph word tolerance
+# ---------------------------------------------------------------------------
+# Some PDF producers (observed on certain Cell Press/Elsevier exports) place
+# words via pure glyph positioning with no literal space character in the
+# content stream at all. pdfplumber then decides word boundaries purely from
+# the geometric gap between adjacent characters vs. x_tolerance (default 3pt,
+# used everywhere in this file); when such a PDF's true inter-word gap is
+# smaller than that, words are silently glued together
+# ("wordsgluedlikethis"), which breaks anything downstream that needs the
+# real source text (e.g. matching an excerpt back to its source for
+# citation grounding).
+#
+# _derive_word_gap_threshold below detects this -- via two independent,
+# confident, measured gates, exactly the same philosophy as
+# _detect_column_gutter -- and derives a page-specific x_tolerance from that
+# page's own character-gap distribution, instead of guessing a single global
+# constant. Every gate is calibrated against the one confirmed real repro
+# (kerning gaps ~0.0pt, real inter-word gap 1.2pt); treat as a starting point
+# pending a larger corpus of real "glued" PDFs.
+_MIN_CHARS_FOR_GAP_ANALYSIS = 200  # mirror _CHARS_PER_PAGE_THRESHOLD -- too little text, no reliable signal
+# Real glued pages aren't uniformly glued -- parenthetical citations,
+# accession-number lists, etc. keep literal spaces even on an otherwise-glued
+# page. Measured directly against the real repro document's glued
+# "Experimental Procedures" section: space characters are ~1.4-1.7% of text
+# there, not 0%. Calibrated with margin above that (still ~3x) while staying
+# far below normal English prose's ~15-17% space ratio, so
+# _MIN_AVG_WORD_LEN_FOR_GLUING_SIGNAL remains the gate that protects normal
+# pages from a false trigger.
+_MAX_SPACE_CHAR_FRACTION = 0.05  # pages already using real space glyphs throughout must be left untouched
+_MIN_AVG_WORD_LEN_FOR_GLUING_SIGNAL = 15  # default-tolerance "words" averaging longer than this look glued (English mean word length ~4.7 chars)
+_MIN_GAP_SAMPLES = 60  # need enough adjacent-char gaps for the distribution to mean anything
+_MIN_GAP_CLUSTER_FRACTION = 0.05  # each side of a candidate split must hold a real share of the gaps, not a lone outlier
+_MAX_UPPER_GAP_CLUSTER_FRACTION = 0.5  # word-boundary gaps should be a minority of all adjacent-char gaps in real prose
+_MIN_GAP_JUMP_PT = 0.4  # the jump between the two populations must be non-trivial in absolute terms
+_MIN_GAP_JUMP_TO_SPREAD_RATIO = 3.0  # the jump must dwarf the lower (kerning) cluster's own spread, or it's not a real bimodal split
 
-def _detect_column_gutter(page: "pdfplumber.page.Page") -> Optional[Tuple[float, float]]:
+
+def _detect_column_gutter(
+    page: "pdfplumber.page.Page", x_tolerance: float = DEFAULT_X_TOLERANCE
+) -> Optional[Tuple[float, float]]:
     """Return (gutter_x0, gutter_x1) if *page* has a confident two-column
     layout, else None. A pure function of page geometry -- no I/O.
     """
@@ -193,7 +232,7 @@ def _detect_column_gutter(page: "pdfplumber.page.Page") -> Optional[Tuple[float,
     if not page.width or not page.height:
         return None  # degenerate/malformed page geometry -- nothing safe to measure
 
-    words = [w for w in page.extract_words() if w.get("upright", True)]
+    words = [w for w in page.extract_words(x_tolerance=x_tolerance) if w.get("upright", True)]
     if len(words) < _MIN_WORDS_FOR_COLUMN_DETECTION:
         return None
 
@@ -283,6 +322,115 @@ def _detect_column_gutter(page: "pdfplumber.page.Page") -> Optional[Tuple[float,
     return best["x0"], best["x1"]
 
 
+def _page_needs_gap_derived_tolerance(page: "pdfplumber.page.Page") -> bool:
+    """True only when *page* independently shows both: (a) essentially no
+    literal space glyphs despite substantial text, and (b) today's
+    default-tolerance extraction already produces suspiciously long "words"
+    (i.e. words are actually glued runs). Both must hold so a page that's
+    merely low on spaces for a legitimate reason (e.g. a dense table of
+    identifiers) doesn't get an unnecessary override --
+    _find_bimodal_gap_threshold is a further, independent gate on top.
+    """
+    if getattr(page, "rotation", 0) not in (0, None):
+        return False  # rotated pages: same axis-reliability caveat as _detect_column_gutter
+    chars = getattr(page, "chars", None)
+    if not chars:
+        return False
+    text_chars = [c for c in chars if c.get("upright", True)]
+    if len(text_chars) < _MIN_CHARS_FOR_GAP_ANALYSIS:
+        return False
+    space_count = sum(1 for c in text_chars if c["text"].isspace())
+    if space_count / len(text_chars) > _MAX_SPACE_CHAR_FRACTION:
+        return False
+    words = page.extract_words()
+    if not words:
+        return False
+    avg_word_len = sum(len(w["text"]) for w in words) / len(words)
+    return avg_word_len >= _MIN_AVG_WORD_LEN_FOR_GLUING_SIGNAL
+
+
+def _collect_adjacent_char_gaps(page: "pdfplumber.page.Page") -> List[float]:
+    """Adjacent same-line, non-space character x-gaps on *page*. Pure
+    function of page.chars -- no I/O.
+    """
+    chars = [c for c in page.chars if c.get("upright", True) and not c["text"].isspace()]
+    if len(chars) < 2:
+        return []
+    lines = cluster_objects(chars, "top", _LINE_CLUSTER_TOLERANCE_PT)
+    gaps: list[float] = []
+    for line in lines:
+        line_sorted = sorted(line, key=lambda c: c["x0"])
+        for a, b in zip(line_sorted, line_sorted[1:]):
+            gaps.append(max(b["x0"] - a["x1"], 0.0))
+    return gaps
+
+
+def _find_bimodal_gap_threshold(gaps: List[float]) -> Optional[float]:
+    """Look for a genuine two-population split in *gaps* -- a tight
+    "kerning" population near 0 and a separate, larger "word-boundary"
+    population -- and return a threshold between them, biased toward the
+    lower cluster. Returns None when no confident split exists (e.g. a
+    continuous/unimodal spread, as on normally-kerned or letter-spaced
+    text).
+
+    Scans candidate split indices in increasing order and returns the
+    FIRST one that clears both confidence checks, rather than the single
+    largest jump anywhere in the valid range. Taking the largest jump is
+    wrong whenever a third population of legitimately wider (but still
+    non-word-boundary) gaps -- e.g. around superscripts/subscripts or
+    numbering runs -- reaches _MIN_GAP_CLUSTER_FRACTION of samples: the
+    biggest jump then sits between the real word-gap cluster and that third
+    population, not between kerning and real word-gaps, which silently
+    picks a much-too-large threshold. Scanning left-to-right instead always
+    finds the boundary of the tight low kerning cluster first.
+    """
+    if len(gaps) < _MIN_GAP_SAMPLES:
+        return None
+    s = sorted(gaps)
+    n = len(s)
+    min_side = max(1, int(n * _MIN_GAP_CLUSTER_FRACTION))
+    max_upper = int(n * _MAX_UPPER_GAP_CLUSTER_FRACTION)
+
+    for i in range(min_side, n - min_side + 1):
+        if (n - i) > max_upper:
+            continue
+        jump = s[i] - s[i - 1]
+        if jump < _MIN_GAP_JUMP_PT:
+            continue
+        lower_spread = s[i - 1] - s[0]
+        if jump < _MIN_GAP_JUMP_TO_SPREAD_RATIO * max(lower_spread, 0.05):
+            continue
+        return s[i - 1] + jump / 2
+
+    return None
+
+
+def _derive_word_gap_threshold(page: "pdfplumber.page.Page") -> Optional[float]:
+    """Page-specific x_tolerance derived from *page*'s own char-gap
+    distribution, or None when pdfplumber's DEFAULT_X_TOLERANCE should be
+    used unchanged (the case for the overwhelming majority of pages).
+    """
+    try:
+        if not _page_needs_gap_derived_tolerance(page):
+            return None
+        threshold = _find_bimodal_gap_threshold(_collect_adjacent_char_gaps(page))
+        if threshold is None:
+            return None
+        # Only ever tighten, never loosen, relative to pdfplumber's default --
+        # this fix must never merge words on a page that wasn't glued.
+        threshold = min(threshold, DEFAULT_X_TOLERANCE)
+        logger.debug("Derived x_tolerance=%.2f for page with no literal space glyphs", threshold)
+        return threshold
+    except Exception:
+        logger.debug("Word-gap tolerance derivation failed, using pdfplumber's default", exc_info=True)
+        return None
+
+
+def _effective_x_tolerance(page: "pdfplumber.page.Page") -> float:
+    threshold = _derive_word_gap_threshold(page)
+    return threshold if threshold is not None else DEFAULT_X_TOLERANCE
+
+
 def _extract_page_text_column_aware(page: "pdfplumber.page.Page") -> str:
     """Extract a page's text, reading a confidently-detected two-column page
     column-major (full left column, then full right column) instead of
@@ -296,17 +444,18 @@ def _extract_page_text_column_aware(page: "pdfplumber.page.Page") -> str:
     failing the whole document's conversion.
     """
     try:
-        gutter = _detect_column_gutter(page)
+        x_tolerance = _effective_x_tolerance(page)
+        gutter = _detect_column_gutter(page, x_tolerance=x_tolerance)
         if gutter is None:
-            return page.extract_text() or ""
+            return page.extract_text(x_tolerance=x_tolerance) or ""
 
         mid = (gutter[0] + gutter[1]) / 2
-        left = page.within_bbox((0, 0, mid, page.height)).extract_text() or ""
-        right = page.within_bbox((mid, 0, page.width, page.height)).extract_text() or ""
+        left = page.within_bbox((0, 0, mid, page.height)).extract_text(x_tolerance=x_tolerance) or ""
+        right = page.within_bbox((mid, 0, page.width, page.height)).extract_text(x_tolerance=x_tolerance) or ""
 
         # Cheap RTL accommodation: if most words on the page are RTL-directed,
         # the visually-first column is the right one.
-        words = page.extract_words()
+        words = page.extract_words(x_tolerance=x_tolerance)
         if words and sum(1 for w in words if w.get("direction") == "rtl") / len(words) > 0.5:
             left, right = right, left
 

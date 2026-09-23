@@ -22,15 +22,28 @@ const SANDBOX_EXTENSIONS = new Set(['html', 'htm', 'svg']);
  */
 const TEXT_EXTENSIONS = new Set(['txt', 'text', 'md', 'markdown', 'csv', 'tsv', 'json', 'log']);
 
+/**
+ * Binary office formats DocumentUpload accepts that aren't inline-renderable
+ * or text-renderable, but are still real, known extensions that should
+ * legitimately fall to the download-only branch below (as opposed to an
+ * arbitrary alphanumeric tail that merely looks like an extension).
+ */
+const OTHER_KNOWN_EXTENSIONS = new Set(['doc', 'docx', 'rtf']);
+
 const extensionOf = (name: string): string => {
   const dot = name.lastIndexOf('.');
   if (dot < 0) return '';
   const ext = name.slice(dot + 1).toLowerCase();
-  // Only treat the suffix as a real extension if it looks like one. Document
-  // names often contain internal periods (e.g. "... Order No. 19-cv-7151"),
-  // where the text after the last dot is not an extension; those resolve to ''
-  // so they take the text-renderable path instead of the download fallback.
-  return /^[a-z0-9]{1,8}$/.test(ext) && /[a-z]/.test(ext) ? ext : '';
+  // Only treat the suffix as a real extension if it's one we actually know —
+  // not just "looks like one". Document/paper names often contain internal
+  // periods with a short alphanumeric tail that isn't a real extension (an
+  // arXiv-style ID's version suffix like "2512.10004v2", a docket number's
+  // trailing fragment, etc.); a generic shape-based regex was previously
+  // fooled by these. Those still resolve to '' so they take the
+  // text-renderable path instead of the false "preview unavailable" state.
+  const isKnownExtension =
+    INLINE_EXTENSIONS.has(ext) || TEXT_EXTENSIONS.has(ext) || OTHER_KNOWN_EXTENSIONS.has(ext);
+  return isKnownExtension ? ext : '';
 };
 
 type Availability = 'idle' | 'checking' | 'ok' | 'unavailable';
