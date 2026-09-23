@@ -336,16 +336,19 @@ class PaperProcessor:
         """
         if not source_text:
             return cleaned
-        if getattr(self, "_active_figure_images", None):
-            # An answer here may legitimately come from reading an attached
-            # figure image rather than the document's text (e.g. "what color
-            # appears in this figure") — there's no text excerpt to find for
-            # that, so this check can't distinguish "vision-derived" from
-            # "fabricated" and would null out correct answers. Skip grounding
-            # for units with attached images; the text-only path below still
-            # gets full enforcement.
-            return cleaned
+        # ground_all_excerpts only stamps char_start/char_end/grounding_status
+        # onto excerpts -- it never deletes an answer -- so it's safe (and
+        # gives the frontend real highlighting data instead of nothing) to
+        # run it unconditionally, even for units with an attached figure
+        # image. Only the null-ENFORCEMENT loop below is skipped for those
+        # units: an answer there may legitimately come from reading the
+        # image itself (e.g. "what color appears in this figure") rather
+        # than the document's text, so a missing/ungrounded excerpt can't
+        # be distinguished from "vision-derived" vs "fabricated" and
+        # enforcing here would null out correct answers.
         grounding_stats = self.excerpt_grounder.ground_all_excerpts(cleaned, source_text)
+        if getattr(self, "_active_figure_images", None):
+            return cleaned
         if grounding_stats.get("not_found", 0) > 0:
             print(
                 f"📍 Excerpt grounding for {context_label}: "
@@ -368,6 +371,16 @@ class PaperProcessor:
                 exc.get("grounding_status") for exc in excerpts if isinstance(exc, dict)
             }
             grounded = bool(statuses & {"exact", "case_insensitive", "fuzzy"})
+            if not grounded:
+                # A figure-typed excerpt (image-derived answer, matched via
+                # caption fuzzy-matching rather than an attached image) has
+                # no text span to ground and is skipped by ground_all_excerpts
+                # entirely -- it's still legitimate support, same category as
+                # the attached-figure-image carve-out above.
+                grounded = any(
+                    isinstance(exc, dict) and exc.get("type") == "figure"
+                    for exc in excerpts
+                )
             if not grounded:
                 # ExcerptGrounder's fuzzy phase re-verifies a word-level match by
                 # joining the matched words with single spaces and doing a plain
@@ -547,6 +560,83 @@ class PaperProcessor:
                 ):
                     self.suggested_values[col_name][value].append(document_name)
 
+    def _column_dict_for_prompt(self, col: Column) -> dict:
+        """Column spec dict for the EXTRACTION prompt -- unlike col.to_dict()
+        (used for storage/other purposes), this never includes a genuinely
+        categorical allowed_values list, regardless of how many documents
+        have corroborated it.
+
+        Real format constraints (date/number/min-max range -- a structural
+        rule the schema itself declares about output FORMATTING) are kept,
+        since removing those would just make output formatting less
+        consistent for no safety benefit. But a categorical allowed_values
+        list is content the model could simply copy as its "extracted"
+        answer instead of actually looking at this specific document/figure
+        -- which is exactly what was happening (e.g. one document's real
+        figure title got copied verbatim into 6 unrelated documents' rows,
+        each with no supporting excerpt, because the model could just read
+        it off the prompt's own "allowed values" hint). Any reconciling of
+        similar wording across documents now happens strictly AFTER each
+        document has produced its own independently-grounded answer -- see
+        _semantic_matcher, used by postprocess().
+        """
+        d = col.to_dict()
+        if col.allowed_values and not self.json_parser.is_type_constraint(col.allowed_values):
+            d.pop("allowed_values", None)
+        return d
+
+    def _semantic_matcher(self, answer: str, allowed_values: List[str]) -> Optional[str]:
+        """Ask the fast/cheap extraction backend whether `answer` means the
+        same real-world thing as one of `allowed_values`, so wording can be
+        reconciled across documents WITHOUT ever having shown the model
+        those values during extraction (see _column_dict_for_prompt).
+
+        This replaces difflib string-similarity for categorical matching:
+        a fixed ratio threshold is a weak proxy for meaning and fails
+        exactly the free-form, sentence-length answers this column type
+        tends to produce (two genuinely-equivalent descriptions phrased
+        very differently score low on difflib but should read as "the
+        same" semantically). Returns the matched candidate VERBATIM (never
+        text the model invents that isn't actually in allowed_values), or
+        None if nothing matches or the call fails -- callers must treat
+        None as "leave the raw answer as its own, ungrounded-in-anyone-
+        else's-wording answer," never as an error to propagate.
+
+        This is a small, isolated text-only call -- deliberately NOT
+        routed through self._generate(), which would attach the current
+        document's figure images / context cache; neither is relevant or
+        wanted for a plain wording-equivalence check between two strings.
+        """
+        if not answer or not allowed_values:
+            return None
+        candidates_text = "\n".join(f"- {v}" for v in allowed_values)
+        prompt = (
+            "You are checking whether a newly extracted answer means the same "
+            "real-world thing as one of a list of previously accepted answers "
+            "for the same data field, even if worded differently.\n\n"
+            f"New answer: {answer!r}\n\n"
+            f"Previously accepted answers:\n{candidates_text}\n\n"
+            "If the new answer means the same thing as exactly one of the "
+            "previously accepted answers, reply with that accepted answer's "
+            "text VERBATIM and nothing else. If it does not clearly match "
+            "any of them, reply with exactly: NONE"
+        )
+        try:
+            raw = self.llm.generate(prompt, temperature=0, max_output_tokens=200)
+        except Exception:
+            logger.warning(
+                "Semantic allowed-value matcher call failed; leaving answer unmatched",
+                exc_info=True,
+            )
+            return None
+        reply = (raw or "").strip()
+        if reply.upper() == "NONE":
+            return None
+        for v in allowed_values:
+            if v.strip() == reply:
+                return v
+        return None
+
     def _enforceable_allowed_values(self, column: Column) -> List[str]:
         """Subset of column.allowed_values corroborated by enough distinct
         documents (column.auto_expand_threshold) to be safely enforced.
@@ -562,15 +652,27 @@ class PaperProcessor:
         document-grounded answer with borrowed text from a different
         document's subject matter.
 
-        A value only becomes enforceable once corroborated by
-        `threshold - 1` OTHER documents beyond whichever one seeded it (see
+        A value only becomes enforceable once `threshold` DISTINCT documents
+        have independently produced it as their own raw answer (see
         _record_allowed_value_confirmations, which populates
         self._allowed_value_confirmations from each document's own raw,
-        not-yet-enforced answer). A value that genuinely recurs across
-        documents earns enforcement automatically as those documents get
-        processed; a value that's actually specific to one document's
-        subject matter never accumulates a second independent occurrence
-        and is simply left as each document's own real answer.
+        not-yet-enforced answer). This intentionally counts ALL recorded
+        documents, including whichever one happened to seed the value in
+        the schema in the first place -- schema discovery doesn't record
+        per-value provenance, so there's no way to identify and exclude
+        "the seed" specifically. Requiring the full `threshold` (not
+        `threshold - 1`) is what actually keeps this guardrail meaningful:
+        with the previous `threshold - 1` version, threshold=2 (a common
+        default) meant a value became "enforceable" the moment its OWN
+        seeding document matched it once -- zero independent corroboration
+        actually required, silently defeating the guardrail's purpose. A
+        value that genuinely recurs across documents (e.g. "graph_type":
+        bar chart/line plot/...) still earns enforcement automatically as
+        real documents independently reproduce it; a value that's actually
+        specific to one document's subject matter (e.g. a figure's own
+        title, wrongly seeded as if categorical) never accumulates a
+        second independent occurrence and is simply left as each
+        document's own real answer.
         """
         if not column.allowed_values:
             return []
@@ -580,7 +682,7 @@ class PaperProcessor:
         if self.json_parser.is_type_constraint(column.allowed_values):
             return column.allowed_values  # format rule, not a borrowed-content risk
         confirmed = self._allowed_value_confirmations.get(column.name, {})
-        return [v for v in column.allowed_values if len(confirmed.get(v, ())) >= threshold - 1]
+        return [v for v in column.allowed_values if len(confirmed.get(v, ())) >= threshold]
 
     def _record_allowed_value_confirmations(
         self, parsed: Dict[str, Any], columns: List[Column], document_name: str
@@ -900,7 +1002,7 @@ class PaperProcessor:
             schema.query,
             paper_title,
             eff,
-            [col.to_dict()],
+            [self._column_dict_for_prompt(col)],
             mode="one_by_one",
             strict=strict,
         )
@@ -927,7 +1029,7 @@ class PaperProcessor:
                 {col.name: self._enforceable_allowed_values(col)} if col.allowed_values else {}
             )
             cleaned, unmatched = self.json_parser.postprocess(
-                parsed, [col.name], column_allowed_values
+                parsed, [col.name], column_allowed_values, semantic_matcher=self._semantic_matcher
             )
             result = cleaned.get(col.name, {})
 
@@ -1003,7 +1105,7 @@ class PaperProcessor:
             schema.query,
             paper_title,
             eff,
-            [col.to_dict() for col in columns],
+            [self._column_dict_for_prompt(col) for col in columns],
             mode="all",
             strict=True,  # strict for fallback
             already_extracted=already_extracted,
@@ -1039,7 +1141,7 @@ class PaperProcessor:
                 c.name: self._enforceable_allowed_values(c) for c in columns if c.allowed_values
             }
             cleaned, unmatched = self.json_parser.postprocess(
-                parsed, requested, column_allowed_values
+                parsed, requested, column_allowed_values, semantic_matcher=self._semantic_matcher
             )
 
             # Track unmatched values for schema evolution
@@ -1128,7 +1230,7 @@ class PaperProcessor:
                     schema.query,
                     paper_title,
                     effective_text,
-                    [c.to_dict() for c in p2_batch],
+                    [self._column_dict_for_prompt(c) for c in p2_batch],
                     mode="all",
                     strict=True,
                     already_extracted=already_flat,
@@ -1165,6 +1267,7 @@ class PaperProcessor:
                         parsed_re,
                         [c.name for c in p2_batch],
                         reorder_allowed,
+                        semantic_matcher=self._semantic_matcher,
                     )
                     self._track_unmatched_values(unmatched_re, paper_title)
                     self._record_allowed_value_confirmations(parsed_re, p2_batch, paper_title)
@@ -1374,7 +1477,7 @@ class PaperProcessor:
                 schema.query,
                 paper_title,
                 eff,
-                [col.to_dict()],
+                [self._column_dict_for_prompt(col)],
                 mode="one_by_one",
                 strict=strict,
             )
@@ -1408,7 +1511,7 @@ class PaperProcessor:
                     {col.name: self._enforceable_allowed_values(col)} if col.allowed_values else {}
                 )
                 cleaned, unmatched = self.json_parser.postprocess(
-                    parsed, [col.name], column_allowed_values
+                    parsed, [col.name], column_allowed_values, semantic_matcher=self._semantic_matcher
                 )
                 result = cleaned.get(col.name, {})
 
@@ -1457,7 +1560,7 @@ class PaperProcessor:
                     schema.query,
                     paper_title,
                     eff,
-                    [c.to_dict() for c in col_batch],
+                    [self._column_dict_for_prompt(c) for c in col_batch],
                     mode="all",
                     strict=False,
                 )
@@ -1498,7 +1601,7 @@ class PaperProcessor:
                     if c.allowed_values
                 }
                 batch_cleaned, unmatched = self.json_parser.postprocess(
-                    parsed, requested, column_allowed_values
+                    parsed, requested, column_allowed_values, semantic_matcher=self._semantic_matcher
                 )
                 self._track_unmatched_values(unmatched, paper_title)
                 self._record_allowed_value_confirmations(parsed, col_batch, paper_title)
@@ -2141,7 +2244,7 @@ class PaperProcessor:
                 schema.query,
                 f"{paper_title} - {unit_name}",
                 eff,
-                [c.to_dict() for c in col_batch],
+                [self._column_dict_for_prompt(c) for c in col_batch],
                 mode="all",
                 strict=False,
                 already_extracted=already_extracted,
@@ -2199,7 +2302,7 @@ class PaperProcessor:
                     if c.allowed_values
                 }
                 cleaned, unmatched = self.json_parser.postprocess(
-                    parsed, requested, column_allowed_values
+                    parsed, requested, column_allowed_values, semantic_matcher=self._semantic_matcher
                 )
                 self._track_unmatched_values(unmatched, paper_title)
                 self._record_allowed_value_confirmations(parsed, col_batch, paper_title)

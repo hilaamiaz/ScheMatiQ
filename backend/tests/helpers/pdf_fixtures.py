@@ -103,6 +103,49 @@ def build_two_column_table_pdf(path: Path, *, rows: int = 40, page_size=letter) 
     c.save()
 
 
+def build_two_column_prose_with_ragged_reference_column_pdf(
+    path: Path,
+    dense_text: str,
+    *,
+    page_size=letter,
+) -> None:
+    """A two-column page shaped like the end of a Methods section running
+    beside the start of a References list: the left column is dense,
+    full-height wrapped prose (like build_two_column_pdf's left column), but
+    the right column has short, few-word citation-style fragments and --
+    critically -- fewer total lines than the left column over the same
+    vertical span (References-list line spacing doesn't align 1:1 with the
+    left column's line grid). This reproduces the geometric shape that
+    caused a genuine two-column research-paper page to be misdetected as
+    not-two-column: low line-coverage fraction and low average
+    words-per-line on the sparser side, despite being real two-column
+    running text, not a numeric table.
+    """
+    width, height = page_size
+    left_x, right_x = 50, width / 2 + 15
+    col_width = width / 2 - 65
+
+    c = Canvas(str(path), pagesize=page_size)
+    c.setFont(_FONT_NAME, _FONT_SIZE)
+
+    left_lines = _wrapped_lines(dense_text, col_width)
+    _draw_column(c, left_lines, left_x, height)
+
+    ref_fragments = ["Smith J.", "Jones AB, 1998.", "Lee C."]
+    y = height - _TOP_MARGIN
+    row = 0
+    frag_i = 0
+    while y >= _BOTTOM_MARGIN and row < len(left_lines):
+        if row % 2 == 0:
+            c.drawString(right_x, y, ref_fragments[frag_i % len(ref_fragments)])
+            frag_i += 1
+        y -= _LINE_HEIGHT
+        row += 1
+
+    c.showPage()
+    c.save()
+
+
 def build_short_gap_heading_pdf(path: Path, heading: str, body_text: str, *, page_size=letter) -> None:
     """A single-column page whose heading has a wide letter/word-spaced gap on
     only its first couple of lines, followed by ordinary single-column body

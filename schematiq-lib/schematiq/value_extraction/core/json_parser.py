@@ -4,7 +4,7 @@ import difflib
 import json
 import re
 from datetime import datetime
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Callable, Dict, Any, List, Tuple, Optional
 
 from dateutil import parser as date_parser
 
@@ -213,7 +213,8 @@ class JSONResponseParser:
         self,
         answer: str,
         allowed_values: List[str],
-        threshold: float = 0.8
+        threshold: float = 0.8,
+        semantic_matcher: Optional[Callable[[str, List[str]], Optional[str]]] = None,
     ) -> Tuple[str, bool, Optional[str]]:
         """
         Normalize extracted answer to closest allowed value using soft matching.
@@ -225,8 +226,13 @@ class JSONResponseParser:
         1. Date constraints (single-item "date" / "date:...") -> parse and format
         2. Numeric constraints (single-item "number" or min-max range)
         3. Case-insensitive exact match -> return allowed value
-        4. Fuzzy match above threshold -> return allowed value
-        5. No match -> keep original answer and flag for schema evolution
+        4. semantic_matcher(answer, allowed_values), if provided -> return its match
+           (an LLM-backed meaning check, since a fixed string-similarity ratio is a
+           weak proxy for meaning and fails free-form, sentence-length answers)
+        5. Otherwise, fuzzy string match above threshold -> return allowed value
+           (kept as a dependency-free fallback for callers with no LLM access,
+           e.g. isolated tests)
+        6. No match -> keep original answer and flag for schema evolution
         """
         if not allowed_values or not answer:
             return answer, False, None
@@ -281,7 +287,14 @@ class JSONResponseParser:
             if av.lower().strip() == answer_lower:
                 return av, True, None
 
-        # Fuzzy matching using difflib
+        # Semantic (LLM-backed) equivalence check, when a matcher was supplied
+        if semantic_matcher is not None:
+            matched = semantic_matcher(answer, allowed_values)
+            if matched is not None:
+                return matched, True, None
+            return answer, False, answer
+
+        # Fuzzy matching using difflib (fallback when no semantic_matcher given)
         best_match: Optional[str] = None
         best_ratio: float = 0.0
         for av in allowed_values:
@@ -343,7 +356,8 @@ class JSONResponseParser:
         self,
         parsed: Dict[str, Dict[str, Any]],
         requested_cols: List[str],
-        column_allowed_values: Optional[Dict[str, List[str]]] = None
+        column_allowed_values: Optional[Dict[str, List[str]]] = None,
+        semantic_matcher: Optional[Callable[[str, List[str]], Optional[str]]] = None,
     ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[str]]]:
         """
         Ensure missing columns are omitted or set to {} and clean placeholders.
@@ -353,6 +367,10 @@ class JSONResponseParser:
             parsed: Parsed LLM response
             requested_cols: List of requested column names
             column_allowed_values: Dict mapping column_name to list of allowed values
+            semantic_matcher: Optional LLM-backed equivalence check, passed
+                through to _normalize_to_allowed_values (see its docstring).
+                Callers with LLM access (PaperProcessor) should supply this;
+                it falls back to difflib string-similarity when omitted.
 
         Returns:
             Tuple of:
@@ -410,7 +428,9 @@ class JSONResponseParser:
                 # gone entirely," which is worse. Leaving exs as the model's
                 # own real excerpt lets _ground_and_enforce's actual
                 # source-text verification decide its fate instead.
-                ans, normalized, unmatched_original = self._normalize_to_allowed_values(ans, column_allowed_values[col])
+                ans, normalized, unmatched_original = self._normalize_to_allowed_values(
+                    ans, column_allowed_values[col], semantic_matcher=semantic_matcher
+                )
 
             out[col] = {"answer": ans, "excerpts": exs}
             if figs:

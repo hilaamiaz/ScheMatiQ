@@ -13,6 +13,7 @@ test_figure_citations.py), so no real LLM or on-disk pipeline is needed.
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
+from schematiq.core.schema import Column
 from schematiq.value_extraction.core.json_parser import JSONResponseParser
 from schematiq.value_extraction.core.paper_processor import PaperProcessor
 from schematiq.value_extraction.utils.excerpt_grounder import ExcerptGrounder
@@ -25,12 +26,29 @@ class FakeColumn:
     auto_expand_threshold: Optional[int] = 2
 
 
+class FakeLLM:
+    """Stand-in for the LLM backend, used to test _semantic_matcher without
+    a real API call."""
+
+    def __init__(self, reply: str = "NONE"):
+        self.reply = reply
+        self.calls: List[str] = []
+
+    def generate(self, prompt, **kwargs):
+        self.calls.append(prompt)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
 class FakeSelf:
     """Minimal stand-in for a PaperProcessor instance."""
 
-    def __init__(self):
+    def __init__(self, llm: Optional[FakeLLM] = None):
         self.json_parser = JSONResponseParser()
         self._allowed_value_confirmations: Dict[str, Dict[str, Set[str]]] = {}
+        if llm is not None:
+            self.llm = llm
 
 
 def _enforceable(fake_self: FakeSelf, column: FakeColumn) -> List[str]:
@@ -50,11 +68,11 @@ class TestEnforceableAllowedValues:
         assert _enforceable(s, column) == []
 
     def test_value_becomes_enforceable_once_corroborated(self):
-        """Once a second, distinct document has independently produced the
-        same value, it graduates to enforceable."""
+        """Once threshold (2) DISTINCT documents have independently produced
+        the same value, it graduates to enforceable."""
         s = FakeSelf()
         column = FakeColumn(name="graph_type", allowed_values=["bar chart"])
-        s._allowed_value_confirmations["graph_type"] = {"bar chart": {"paper2.pdf"}}
+        s._allowed_value_confirmations["graph_type"] = {"bar chart": {"paper1.pdf", "paper2.pdf"}}
         assert _enforceable(s, column) == ["bar chart"]
 
     def test_only_corroborated_values_pass_through_others_stay_suppressed(self):
@@ -64,14 +82,35 @@ class TestEnforceableAllowedValues:
             name="key_finding",
             allowed_values=["bar chart finding", "CD45 D1D2 tandem domains"],
         )
-        s._allowed_value_confirmations["key_finding"] = {"bar chart finding": {"paper2.pdf"}}
+        s._allowed_value_confirmations["key_finding"] = {
+            "bar chart finding": {"paper1.pdf", "paper2.pdf"},
+            "CD45 D1D2 tandem domains": {"paper3.pdf"},
+        }
         assert _enforceable(s, column) == ["bar chart finding"]
+
+    def test_seeding_document_alone_is_not_enough(self):
+        """Regression test for the real cross-document-contamination bug:
+        a value confirmed only by the single document that seeded it in
+        the schema (no independent second document) must NOT be
+        enforceable at the default threshold=2 -- otherwise that
+        document's own answer (e.g. one figure's own title) gets pushed
+        onto every other, unrelated document as a "preferred" value the
+        moment schema discovery happens to seed it. This is exactly what
+        was observed in production: a figure_title seeded from one paper
+        was broadcast, unenforced-by-anyone-else, into six other
+        documents' extraction prompts."""
+        s = FakeSelf()
+        column = FakeColumn(name="figure_title", allowed_values=["Some Figure's Own Title"])
+        s._allowed_value_confirmations["figure_title"] = {
+            "Some Figure's Own Title": {"the_seeding_document.pdf"},
+        }
+        assert _enforceable(s, column) == []
 
     def test_higher_threshold_needs_more_corroboration(self):
         s = FakeSelf()
         column = FakeColumn(name="col", allowed_values=["v"], auto_expand_threshold=3)
-        s._allowed_value_confirmations["col"] = {"v": {"paper2.pdf"}}
-        assert _enforceable(s, column) == []  # only 1 extra doc, needs 2
+        s._allowed_value_confirmations["col"] = {"v": {"paper1.pdf", "paper2.pdf"}}
+        assert _enforceable(s, column) == []  # only 2 documents, needs 3
 
         s._allowed_value_confirmations["col"]["v"].add("paper3.pdf")
         assert _enforceable(s, column) == ["v"]
@@ -184,7 +223,8 @@ class TestNormalizationDoesNotInteractBadlyWithGroundAndEnforce:
 
         allowed = ["accuracy of 86.4 percent on the MMLU benchmark for large models"]
         column = FakeColumn(name="key_finding", allowed_values=allowed)
-        s._allowed_value_confirmations["key_finding"] = {allowed[0]: {"doc1"}}  # already corroborated
+        # already corroborated by threshold (2) distinct documents
+        s._allowed_value_confirmations["key_finding"] = {allowed[0]: {"doc0", "doc1"}}
 
         source_text = (
             "In our experiments we report accuracy of 86.4 percent on the "
@@ -260,11 +300,132 @@ class TestEndToEndCrossDocumentContamination:
         assert "normalized_to_allowed" not in out1[column.name]
         _record(s, parsed1, [column], "doc1")
 
-        # Doc 1's occurrence is now on record -- threshold (2) is met, so the
-        # value graduates to enforceable for doc 2 onward.
+        # Doc 1 alone is still not enough -- threshold (2) requires a
+        # second, genuinely independent document before this graduates to
+        # enforceable (the seeding document's own match doesn't count as
+        # its own corroboration).
         enforceable = PaperProcessor._enforceable_allowed_values(s, column)
-        assert enforceable == ["bar chart"]
+        assert enforceable == []
         parsed2 = {column.name: {"answer": "Bar Chart", "excerpts": [{"text": "shown as bars", "source": "doc2"}]}}
         out2, _ = s.json_parser.postprocess(parsed2, [column.name], {column.name: enforceable})
-        assert out2[column.name]["answer"] == "bar chart"
-        assert out2[column.name].get("normalized_to_allowed") is True
+        assert out2[column.name]["answer"] == "Bar Chart"
+        assert "normalized_to_allowed" not in out2[column.name]
+        _record(s, parsed2, [column], "doc2")
+
+        # Now two distinct documents (doc1, doc2) have independently
+        # produced this value -- threshold (2) is met, so it graduates to
+        # enforceable for doc 3 onward.
+        enforceable = PaperProcessor._enforceable_allowed_values(s, column)
+        assert enforceable == ["bar chart"]
+        parsed3 = {column.name: {"answer": "Bar chart", "excerpts": [{"text": "displayed via bars", "source": "doc3"}]}}
+        out3, _ = s.json_parser.postprocess(parsed3, [column.name], {column.name: enforceable})
+        assert out3[column.name]["answer"] == "bar chart"
+        assert out3[column.name].get("normalized_to_allowed") is True
+
+
+class TestColumnDictForPrompt:
+    """PaperProcessor._column_dict_for_prompt: the column spec dict actually
+    sent to the extraction LLM must never include a categorical
+    allowed_values list (that's the whole point of this redesign -- the
+    model should never be able to just copy a previously-accepted answer
+    instead of extracting its own), but real format constraints (date /
+    number / range) should still be shown, since those describe expected
+    OUTPUT FORMAT, not "borrowed content" risk."""
+
+    def _dict_for_prompt(self, col: Column) -> dict:
+        s = FakeSelf()
+        return PaperProcessor._column_dict_for_prompt(s, col)
+
+    def test_categorical_allowed_values_is_stripped(self):
+        col = Column(name="graph_type", allowed_values=["bar chart", "line plot"])
+        d = self._dict_for_prompt(col)
+        assert "allowed_values" not in d
+
+    def test_type_constraint_allowed_values_is_kept(self):
+        col = Column(name="accuracy_pct", allowed_values=["0-100"])
+        d = self._dict_for_prompt(col)
+        assert d["allowed_values"] == ["0-100"]
+
+    def test_column_with_no_allowed_values_is_unaffected(self):
+        col = Column(name="free_text_col")
+        d = self._dict_for_prompt(col)
+        assert "allowed_values" not in d
+        assert d["column"] == "free_text_col"
+
+
+class TestSemanticMatcher:
+    """PaperProcessor._semantic_matcher: the post-hoc, LLM-backed
+    equivalence check that reconciles wording across documents WITHOUT
+    ever having shown the model those values during extraction."""
+
+    def test_matching_reply_returns_the_canonical_candidate_verbatim(self):
+        s = FakeSelf(llm=FakeLLM(reply="bar chart"))
+        result = PaperProcessor._semantic_matcher(
+            s, "a chart made of vertical bars", ["bar chart", "line plot"]
+        )
+        assert result == "bar chart"
+        assert len(s.llm.calls) == 1
+
+    def test_none_reply_returns_none(self):
+        s = FakeSelf(llm=FakeLLM(reply="NONE"))
+        result = PaperProcessor._semantic_matcher(
+            s, "something unrelated", ["bar chart", "line plot"]
+        )
+        assert result is None
+
+    def test_reply_not_in_candidates_is_rejected_not_trusted_verbatim(self):
+        """The model must not be able to invent a value that isn't
+        actually one of the real candidates -- only an exact, verbatim
+        match against allowed_values counts."""
+        s = FakeSelf(llm=FakeLLM(reply="a completely made up value"))
+        result = PaperProcessor._semantic_matcher(s, "some answer", ["bar chart"])
+        assert result is None
+
+    def test_llm_call_failure_is_treated_as_no_match_not_an_exception(self):
+        s = FakeSelf(llm=FakeLLM(reply=RuntimeError("API down")))
+        result = PaperProcessor._semantic_matcher(s, "some answer", ["bar chart"])
+        assert result is None
+
+    def test_no_candidates_short_circuits_without_calling_the_llm(self):
+        s = FakeSelf(llm=FakeLLM(reply="bar chart"))
+        result = PaperProcessor._semantic_matcher(s, "some answer", [])
+        assert result is None
+        assert s.llm.calls == []
+
+
+class TestPostprocessWithSemanticMatcher:
+    """postprocess()'s categorical branch, driven with a real
+    semantic_matcher callable (as PaperProcessor supplies in production),
+    instead of the difflib fallback the rest of this file's tests exercise
+    when no matcher is given."""
+
+    def test_semantic_match_normalizes_answer_but_leaves_excerpt_untouched(self):
+        s = FakeSelf()
+        column = FakeColumn(name="graph_type", allowed_values=["bar chart"])
+        matcher = lambda answer, candidates: "bar chart"  # noqa: E731
+
+        real_excerpt = [{"text": "shown as vertical bars in the figure", "source": "doc1"}]
+        parsed = {column.name: {"answer": "a bar-style chart", "excerpts": real_excerpt}}
+
+        out, _ = s.json_parser.postprocess(
+            parsed, [column.name], {column.name: column.allowed_values}, semantic_matcher=matcher
+        )
+
+        assert out[column.name]["answer"] == "bar chart"
+        assert out[column.name]["excerpts"] == real_excerpt
+        assert out[column.name]["normalized_to_allowed"] is True
+
+    def test_semantic_no_match_keeps_raw_answer_and_flags_unmatched(self):
+        s = FakeSelf()
+        column = FakeColumn(name="graph_type", allowed_values=["bar chart"])
+        matcher = lambda answer, candidates: None  # noqa: E731
+
+        parsed = {column.name: {"answer": "a totally different kind of figure", "excerpts": []}}
+
+        out, unmatched = s.json_parser.postprocess(
+            parsed, [column.name], {column.name: column.allowed_values}, semantic_matcher=matcher
+        )
+
+        assert out[column.name]["answer"] == "a totally different kind of figure"
+        assert "normalized_to_allowed" not in out[column.name]
+        assert unmatched.get(column.name) == ["a totally different kind of figure"]

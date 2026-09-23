@@ -29,6 +29,7 @@ from tests.helpers.pdf_fixtures import (
     build_single_column_pdf,
     build_sparse_pdf,
     build_two_column_pdf,
+    build_two_column_prose_with_ragged_reference_column_pdf,
     build_two_column_table_pdf,
     build_two_column_with_full_width_line_pdf,
 )
@@ -129,6 +130,30 @@ def test_short_gap_run_not_falsely_detected(tmp_path):
 
     with pdfplumber.open(pdf_path) as pdf:
         assert _detect_column_gutter(pdf.pages[0]) is None
+
+
+def test_dense_prose_beside_ragged_reference_column_is_detected(tmp_path):
+    """Regression test: a genuine two-column page (dense body prose beside
+    a References-list-style column, mirroring a real Immunity-journal page
+    that was previously misdetected) must still be read column-major, not
+    silently fall back to interleaving extract_text()."""
+    pdf_path = tmp_path / "prose_and_refs.pdf"
+    build_two_column_prose_with_ragged_reference_column_pdf(pdf_path, LEFT_SENTENCE)
+
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[0]
+        gutter = _detect_column_gutter(page)
+        column_aware = _extract_page_text_column_aware(page)
+        default = page.extract_text() or ""
+
+    assert gutter is not None, (
+        "a dense prose column beside a sparser reference-list column must "
+        "still be detected as two-column"
+    )
+    assert _norm(LEFT_SENTENCE) in _norm(column_aware)
+    # Direct regression proof: the plain top-to-bottom sweep interleaves
+    # the two columns and would scramble the left sentence.
+    assert _norm(LEFT_SENTENCE) not in _norm(default)
 
 
 def test_mixed_layout_document_end_to_end(tmp_path):

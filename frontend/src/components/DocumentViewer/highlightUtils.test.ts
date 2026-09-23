@@ -72,6 +72,18 @@ describe('findHighlightRanges', () => {
     expect(text.slice(...ranges[0])).toBe('accuracy of 86.4 percent on');
   });
 
+  it('falls back to the raw offset when neither the sanity check nor a fresh text search finds it', () => {
+    // char_start/char_end are in-range but point at "Intro." (fails the
+    // first-word sanity check), and the excerpt text itself doesn't appear
+    // anywhere in the document (fragment re-search also comes up empty).
+    // The stored offset should still be used rather than the citation
+    // being dropped entirely.
+    const ranges = findHighlightRanges(text, [
+      { text: 'a phrase that never appears in the source text', char_start: 0, char_end: 6 },
+    ]);
+    expect(ranges).toEqual([[0, 6]]);
+  });
+
   it('drops overlapping ranges, keeping the first', () => {
     const ranges = findHighlightRanges(text, [{ text: 'accuracy of' }, { text: 'accuracy of 86.4 percent on' }]);
     expect(ranges).toHaveLength(1);
