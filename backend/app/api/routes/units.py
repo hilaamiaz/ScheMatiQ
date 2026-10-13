@@ -310,15 +310,16 @@ async def get_document_content(
 def _find_figure(session_id: str, figure_id: str) -> Optional[Tuple[Path, dict]]:
     """Locate a figure's image path and manifest entry by figure_id.
 
-    Scans documents/figures/*/manifest.json under every known data dir (same
-    search roots _find_local_document uses) for a figure whose id matches.
-    This doubles as the allowlist: a figure_id is only ever servable if it
-    actually appears in one of this session's own manifests — never a raw
-    caller-supplied path — so this is safe against path traversal the same
-    way get_document_content's name-allowlist is.
+    Scans figures/*/manifest.json under the session's committed and pending
+    document dirs (same search roots _find_local_document uses — figures stay
+    in pending_documents/ until their document is committed) for a figure
+    whose id matches. This doubles as the allowlist: a figure_id is only ever
+    servable if it actually appears in one of this session's own manifests —
+    never a raw caller-supplied path — so this is safe against path traversal
+    the same way get_document_content's name-allowlist is.
     """
-    for base in candidate_data_dirs():
-        figures_root = base / session_id / "documents" / "figures"
+    for doc_dir_root in local_document_dirs(session_id):
+        figures_root = doc_dir_root / "figures"
         if not figures_root.is_dir():
             continue
         for doc_dir in figures_root.iterdir():
