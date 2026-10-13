@@ -38,6 +38,11 @@ router = APIRouter()
 
 # Module-level singleton (same pattern as schematiq_runner, reextraction_service, etc.)
 from app.services import pubmed_enrichment_service, uniprot_enrichment_service
+from app.services.session_documents import (
+    committed_docs_dir,
+    pending_docs_dir,
+    remove_document_artifacts,
+)
 upload_processor = UploadDocumentProcessor(
     websocket_manager=websocket_manager,
     session_manager=session_manager,
@@ -907,9 +912,9 @@ async def add_documents(session_id: str, files: List[UploadFile] = File(...), by
         # New documents go to pending_documents/ first, then moved to documents/ after processing
         parser = FileParser()
         session_dir = parser.data_dir / session_id
-        pending_dir = session_dir / "pending_documents"
+        pending_dir = pending_docs_dir(session_dir)
         pending_dir.mkdir(parents=True, exist_ok=True)
-        docs_dir = session_dir / "documents"
+        docs_dir = committed_docs_dir(session_dir)
         docs_dir.mkdir(parents=True, exist_ok=True)
         
         # Process each uploaded file
@@ -1150,8 +1155,8 @@ async def remove_uploaded_document(session_id: str, request: RemoveDocumentReque
         # Remove the actual file from pending_documents directory
         parser = FileParser()
         session_dir = parser.data_dir / session_id
-        pending_file = session_dir / "pending_documents" / request.filename
-        docs_file = session_dir / "documents" / request.filename
+        pending_file = pending_docs_dir(session_dir) / request.filename
+        docs_file = committed_docs_dir(session_dir) / request.filename
 
         files_removed = []
         if pending_file.exists():
@@ -1162,6 +1167,11 @@ async def remove_uploaded_document(session_id: str, request: RemoveDocumentReque
             docs_file.unlink()
             files_removed.append(str(docs_file))
             logger.debug(f"Removed file from documents: {docs_file}")
+
+        # Remove the document's per-document artifacts (figures, ...) from both
+        # pending and committed, so nothing is orphaned and a re-upload of the
+        # same filename cannot inherit stale artifacts.
+        remove_document_artifacts(session_dir, stem)
 
         # Update session status if no more documents
         if not session.metadata.uploaded_documents:
@@ -1244,9 +1254,9 @@ async def add_cloud_documents(session_id: str, request: CloudDocumentRequest):
         # Create directories for this session
         parser = FileParser()
         session_dir = parser.data_dir / session_id
-        pending_dir = session_dir / "pending_documents"
+        pending_dir = pending_docs_dir(session_dir)
         pending_dir.mkdir(parents=True, exist_ok=True)
-        docs_dir = session_dir / "documents"
+        docs_dir = committed_docs_dir(session_dir)
         docs_dir.mkdir(parents=True, exist_ok=True)
 
         # Download requested files
@@ -2007,7 +2017,10 @@ def _preprocess_and_record(
             "Remove the existing rows first or use a different filename."
         )
 
-    result = preprocess_uploaded_file(file_path, original_filename=filename, documents_dir=docs_dir)
+    # Extract figures next to the .txt in pending_documents/ (documents_dir=None
+    # resolves to source_path.parent) so they ride the pending -> committed
+    # commit together with the text (see SchematiqRunner._move_pending_documents).
+    result = preprocess_uploaded_file(file_path, original_filename=filename, documents_dir=None)
     if not result.success:
         file_path.unlink(missing_ok=True)
         return None, f"{filename}: {result.status}"

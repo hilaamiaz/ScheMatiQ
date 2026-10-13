@@ -97,17 +97,20 @@ def commit_document_to_documents_dir(
         # itself — it's the single point every upload path funnels through, so
         # hooking it there (rather than here too) covers the initial-upload
         # route as well, which calls preprocess_uploaded_file() directly and
-        # never reaches this function. See its docstring for why documents_dir
-        # is threaded through: figures land straight in their final location
-        # instead of needing to be moved alongside the .txt below.
+        # never reaches this function. This commit path passes documents_dir,
+        # but by the time a file is committed it is usually already a .txt, so
+        # no figure extraction happens here; figures were extracted into
+        # pending_documents/ at upload and are moved into documents/ by
+        # _move_pending_documents.
         #
-        # Reserve the final (de-duplicated) stem up front, before conversion
-        # runs, and pass it through as figure_stem: a same-named document
-        # committed into an already-populated documents_dir (e.g. two source
-        # files that happen to share a base name) would otherwise persist its
-        # figures under the *raw* stem, silently overwriting an earlier
-        # document's figures/{stem}/ folder — the dedup below (which the .txt
-        # file itself benefits from) only runs after that damage is done.
+        # When a non-.txt file does get converted here, reserve the final
+        # (de-duplicated) stem up front, before conversion runs, and pass it
+        # through as figure_stem: a same-named document committed into an
+        # already-populated documents_dir (e.g. two source files that happen
+        # to share a base name) would otherwise persist its figures under the
+        # *raw* stem, silently overwriting an earlier document's
+        # figures/{stem}/ folder — the dedup below (which the .txt file itself
+        # benefits from) only runs after that damage is done.
         reserved_stem = unique_dest_path(documents_dir, f"{source_path.stem}.txt").stem
         result = preprocess_uploaded_file(
             source_path,
@@ -134,6 +137,61 @@ def commit_document_to_documents_dir(
         ext,
     )
     return None
+
+
+def commit_pending_documents(pending_dir: Path, documents_dir: Path) -> int:
+    """Commit every document in ``pending_dir`` into ``documents_dir`` with its artifacts.
+
+    Converts/moves each pending file into documents/ (see
+    ``commit_document_to_documents_dir``), then moves each committed document's
+    per-document artifacts (``PER_DOCUMENT_ARTIFACT_SUBDIRS``, e.g.
+    ``figures/{stem}``) into documents/ as a unit. A stem whose text did not
+    commit is left in pending, so a failed conversion never orphans artifacts in
+    documents/. A leftover symlink from the old figures bridge is removed.
+    Returns the number of documents committed.
+
+    This is the single commit path shared by the post-run mover
+    (``SchematiqRunner._move_pending_documents``) and the import/upload
+    finalizer, so every pending -> committed transition treats artifacts
+    identically and a new artifact type is committed for both by registering it
+    once in ``PER_DOCUMENT_ARTIFACT_SUBDIRS``.
+    """
+    from app.services.session_documents import PER_DOCUMENT_ARTIFACT_SUBDIRS
+
+    if not pending_dir.exists():
+        return 0
+
+    documents_dir.mkdir(parents=True, exist_ok=True)
+    moved_count = 0
+    committed_stems: set[str] = set()
+    for file_path in sorted(pending_dir.iterdir()):
+        if file_path.is_file():
+            dest = commit_document_to_documents_dir(file_path, documents_dir)
+            if dest:
+                moved_count += 1
+                committed_stems.add(dest.stem)
+
+    for subdir in PER_DOCUMENT_ARTIFACT_SUBDIRS:
+        pending_artifact = pending_dir / subdir
+        if pending_artifact.is_symlink():
+            pending_artifact.unlink()
+            continue
+        if not pending_artifact.is_dir():
+            continue
+        committed_artifact = documents_dir / subdir
+        for stem_dir in pending_artifact.iterdir():
+            if not stem_dir.is_dir() or stem_dir.name not in committed_stems:
+                continue
+            committed_artifact.mkdir(parents=True, exist_ok=True)
+            dest_dir = committed_artifact / stem_dir.name
+            if dest_dir.exists():
+                shutil.rmtree(stem_dir, ignore_errors=True)
+            else:
+                shutil.move(str(stem_dir), str(dest_dir))
+        if not any(pending_artifact.iterdir()):
+            pending_artifact.rmdir()
+
+    return moved_count
 
 
 def commit_bytes_to_documents_dir(
@@ -303,11 +361,11 @@ def preprocess_uploaded_file(
     commit_document_to_documents_dir() for pipeline-continuation flows), so
     figure extraction for PDFs is hooked in here rather than in either
     individual caller — it must run before the PDF is deleted below.
-    Figures are persisted straight into ``documents_dir`` (the session's
-    documents/ folder) when given, not wherever source_path happens to sit
-    (pending_documents/ during the initial upload), so they land in their
-    final location immediately rather than needing to be moved/renamed
-    alongside the .txt by whatever later commits it into documents/.
+    Figures are written to ``documents_dir`` when given, else next to the text
+    in ``source_path.parent``. The initial-upload route passes ``None`` so a
+    document's figures land in pending_documents/ alongside its .txt and ride
+    the pending -> committed commit together with it (see
+    SchematiqRunner._move_pending_documents).
 
     ``figure_stem`` lets a caller that already knows the document's *final*
     (collision-free) name reserve that name for figure persistence too — see

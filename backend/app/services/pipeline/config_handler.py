@@ -1,13 +1,13 @@
 """Configuration validation, conversion, and document path resolution."""
 
 import logging
-import shutil
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 from app.core.config import DEFAULT_DATA_DIR
 from app.models.schematiq import ScheMatiQConfig
 from app.storage import get_storage
+from app.services.session_documents import committed_docs_dir, pending_docs_dir
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +55,8 @@ async def resolve_docs_paths(config: ScheMatiQConfig, session_id: str, work_dir:
     # schema-only mode, and silently skip value extraction. Filename-level
     # de-duplication across these dirs is handled by the pipeline loader.
     session_data_dir = Path(DEFAULT_DATA_DIR) / session_id
-    pending_dir = session_data_dir / "pending_documents"
-    documents_dir = session_data_dir / "documents"
+    pending_dir = pending_docs_dir(session_data_dir)
+    documents_dir = committed_docs_dir(session_data_dir)
     local_doc_dirs: List[str] = []
     for candidate in (pending_dir, documents_dir):
         if candidate.exists() and any(
@@ -64,35 +64,11 @@ async def resolve_docs_paths(config: ScheMatiQConfig, session_id: str, work_dir:
         ):
             local_doc_dirs.append(str(candidate.absolute()))
 
-    # Figures are persisted straight into documents/figures/{stem} at upload
-    # time (see preprocess_uploaded_file), even though the matching .txt sits
-    # in pending_documents/ until this run completes and commits it. The
-    # value-extraction pipeline derives each document's figures_dir from
-    # whichever directory it read the text from, so on a document's first
-    # run — before the pending->documents commit — it would look for figures
-    # in pending_documents/figures/{stem} and silently find nothing. Linking
-    # pending_documents/figures to the real documents/figures keeps that
-    # lookup working without duplicating image bytes or touching the
-    # provider-agnostic figures_dir logic in schematiq-lib.
-    pending_figures_link = pending_dir / "figures"
-    real_figures_dir = documents_dir / "figures"
-    if (
-        str(pending_dir.absolute()) in local_doc_dirs
-        and real_figures_dir.is_dir()
-        and not pending_figures_link.exists()
-    ):
-        try:
-            pending_figures_link.symlink_to(real_figures_dir, target_is_directory=True)
-        except OSError:
-            # Symlinks need admin/Developer Mode on Windows — fall back to a
-            # real copy so figures still get attached on this first run.
-            try:
-                shutil.copytree(real_figures_dir, pending_figures_link)
-            except OSError:
-                logger.warning(
-                    "Could not link or copy %s -> %s; figures won't be attached for this run",
-                    pending_figures_link, real_figures_dir,
-                )
+    # Figures are extracted next to their .txt in pending_documents/figures/ at
+    # upload and move into documents/figures/ on commit (see _preprocess_and_record
+    # and SchematiqRunner._move_pending_documents), so a document's figures always
+    # sit in whichever directory the pipeline reads its text from. No
+    # pending->documents figures bridge is needed here.
 
     if local_doc_dirs:
         logger.info("Using session-local documents from: %s", ", ".join(local_doc_dirs))

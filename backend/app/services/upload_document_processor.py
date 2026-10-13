@@ -29,6 +29,7 @@ from app.core.config import DEFAULT_TEMPERATURE, DEFAULT_RETRIEVAL_K, PROGRESS_C
 # Max seconds to wait for build_table_jsonl to observe should_stop() after user stop
 MAX_UPLOAD_EXTRACTION_STOP_WAIT = 120.0
 from app.core.logging_utils import set_session_context
+from app.services.session_documents import committed_docs_dir, pending_docs_dir
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +128,8 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
             
             # Get paths and configuration
             session_dir = Path(DEFAULT_DATA_DIR) / session_id
-            pending_dir = session_dir / "pending_documents"
-            docs_dir = session_dir / "documents"
+            pending_dir = pending_docs_dir(session_dir)
+            docs_dir = committed_docs_dir(session_dir)
 
             if not pending_dir.exists() or not any(pending_dir.iterdir()):
                 raise FileNotFoundError(f"No pending documents to process in: {pending_dir}")
@@ -665,19 +666,15 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
         # Clean up the additional data file
         additional_data_file.unlink(missing_ok=True)
 
-        # Move processed documents from pending_documents/ to documents/
-        from app.services.document_preprocessor import commit_document_to_documents_dir
+        # Move processed documents (and their per-document artifacts, e.g.
+        # figures) from pending_documents/ to documents/ via the shared commit
+        # path, so this finalizer commits artifacts identically to the post-run
+        # mover.
+        from app.services.document_preprocessor import commit_pending_documents
 
-        pending_dir = session_dir / "pending_documents"
-        docs_dir = session_dir / "documents"
-        docs_dir.mkdir(exist_ok=True)
-
-        if pending_dir.exists():
-            for file_path in sorted(pending_dir.iterdir()):
-                if file_path.is_file():
-                    dest = commit_document_to_documents_dir(file_path, docs_dir)
-                    if dest:
-                        logger.debug(f"Committed {dest.name} to documents/")
+        pending_dir = pending_docs_dir(session_dir)
+        docs_dir = committed_docs_dir(session_dir)
+        commit_pending_documents(pending_dir, docs_dir)
 
         # Persist the merged data.jsonl to durable storage so documents added to
         # an imported project survive a redeploy. Without this the read path would
