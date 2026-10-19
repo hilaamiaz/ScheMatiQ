@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 # Rate limit retry utilities                                                 #
 ##############################################################################
 
+# Long unattended runs (hundreds of documents) must ride out rate-limit windows
+# and transient outages instead of failing a document after a few attempts.
+# Both are overridable from the environment.
+LLM_MAX_RETRIES = int(os.getenv("SCHEMATIQ_LLM_MAX_RETRIES", "6"))
+# Per-request wall-clock bound. A request that stalls past this raises
+# httpx.TimeoutException, which _is_retryable_server_error retries.
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("SCHEMATIQ_LLM_TIMEOUT_SECONDS", "300"))
+
 _RATE_LIMIT_STATUS_CODE = 429
 # Transient failures worth retrying with a fixed backoff. 429 is excluded
 # because it is classified separately and uses the provider's own retry hint.
@@ -297,7 +305,7 @@ class TogetherLLM(LLMInterface):
             params["messages"] = [{"role": "user", "content": prompt}]
 
         # Retry logic for rate limits
-        max_retries = 3
+        max_retries = LLM_MAX_RETRIES
         last_exception = None
         
         for attempt in range(max_retries + 1):
@@ -379,7 +387,7 @@ class OpenAILLM(LLMInterface):
             raise ImportError(
                 "pip install openai>=1.0.0  (https://pypi.org/project/openai/)") from e
 
-        self._client = OpenAI(api_key=self.api_key)
+        self._client = OpenAI(api_key=self.api_key, timeout=LLM_REQUEST_TIMEOUT_SECONDS)
         self._default_args: Dict[str, Any] = dict(
             model=self.model,
             max_tokens=self.max_output_tokens,  # OpenAI API uses max_tokens
@@ -408,7 +416,7 @@ class OpenAILLM(LLMInterface):
             params["messages"] = [{"role": "user", "content": prompt}]
 
         # Retry logic for rate limits and server overload
-        max_retries = 3
+        max_retries = LLM_MAX_RETRIES
         last_exception = None
         
         for attempt in range(max_retries + 1):
@@ -664,7 +672,12 @@ class GeminiLLM(LLMInterface):
                 "(https://pypi.org/project/google-genai/)") from e
 
         # Create client with API key (new SDK uses client-based architecture)
-        self._client = genai.Client(api_key=self.api_key)
+        # Bound every request so a stalled connection raises a retryable
+        # timeout instead of blocking the run forever (HttpOptions is in ms).
+        self._client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(timeout=int(LLM_REQUEST_TIMEOUT_SECONDS * 1000)),
+        )
 
         # Configure safety settings to be less restrictive for scientific content
         self.safety_settings = [
@@ -890,7 +903,7 @@ class GeminiLLM(LLMInterface):
         config = self.types.GenerateContentConfig(**config_kwargs)
 
         # Retry logic (3 retries like OpenAI/Together)
-        max_retries = 3
+        max_retries = LLM_MAX_RETRIES
         last_exception = None
 
         for attempt in range(max_retries + 1):
@@ -1116,7 +1129,7 @@ class GeminiLLM(LLMInterface):
         self._apply_thinking_config(config_kwargs, kwargs.get("thinking_budget"))
         config = self.types.GenerateContentConfig(**config_kwargs)
 
-        max_retries = 3
+        max_retries = LLM_MAX_RETRIES
         last_exception = None
 
         for attempt in range(max_retries + 1):

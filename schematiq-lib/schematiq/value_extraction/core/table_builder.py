@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import shutil
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -545,7 +546,13 @@ class TableBuilder:
                 processed_papers.add(paper)
 
             except Exception as e:
-                print(f"⚠️  Error processing {paper.name} for observation units: {e}")
+                # One bad document must not end a long run: record it as
+                # skipped (so it shows up in the skip report) and move on.
+                traceback.print_exc()
+                print(f"⚠️  Error processing {paper.name} for observation units, skipping it: {e}")
+                self._skipped_documents.append(
+                    SkippedDocument(document=paper_title, reason=f"Extraction failed: {e}")
+                )
 
         # Mark original row_name as written if any units were written
         if total_units_written > 0:
