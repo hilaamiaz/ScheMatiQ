@@ -145,7 +145,7 @@ async def run_value_extraction(
             if output_path.exists():
                 completed_documents = set()
                 current_line_count = 0
-                with open(output_path, 'r') as f:
+                with open(output_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         current_line_count += 1
                         try:
@@ -199,7 +199,7 @@ async def run_value_extraction(
     # Final progress update
     final_line_count = 0
     if output_path.exists():
-        with open(output_path, 'r') as f:
+        with open(output_path, 'r', encoding='utf-8') as f:
             final_line_count = sum(1 for _ in f)
 
     session = session_manager.get_session(session_id)

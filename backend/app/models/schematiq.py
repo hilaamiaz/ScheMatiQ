@@ -79,6 +79,12 @@ class ScheMatiQConfig(BaseModel):
     llm_call_limit: Optional[int] = None  # Developer-only: override the global quota limit for this session
     opt_out_data_collection: bool = False  # User opted out of research data archival
     write_artifacts: Optional[bool] = None  # If True, write debug artifacts like skip rationales
+    # Merge rows that describe the same unit (identical identity value, e.g. the
+    # same NES peptide) after extraction and when documents are added. See
+    # app/services/row_merge.py. Not part of the run checkpoint fingerprint.
+    merge_duplicate_rows: bool = False
+    # Columns read for the identity value, in priority order; "_unit_name" reads the unit name.
+    row_identity_columns: Optional[List[str]] = None
 
 class ScheMatiQStatus(BaseModel):
     """Status of ScheMatiQ execution."""

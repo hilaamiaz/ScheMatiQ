@@ -288,7 +288,7 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
             rows_saved = 0
             data_file = session_dir / "extracted_data.jsonl"
             if data_file.exists():
-                with open(data_file, 'r') as f:
+                with open(data_file, 'r', encoding='utf-8') as f:
                     rows_saved = sum(1 for _ in f)
             await self.broadcast_stopped(session_id, {
                 "schema_saved": schema_saved,
@@ -349,7 +349,7 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
                 result["schema_saved"] = True
 
             if data_file.exists():
-                with open(data_file, 'r') as f:
+                with open(data_file, 'r', encoding='utf-8') as f:
                     result["data_rows_saved"] = sum(1 for _ in f)
 
             session = self.session_manager.get_session(session_id)
@@ -480,6 +480,49 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
                 self.running_sessions.pop(session_id, None)
             self.clear_stop_flag(session_id)
             await concurrency_limiter.release(session_id)
+
+    async def merge_duplicate_rows(
+        self, session_id: str, config: ScheMatiQConfig, llm=None,
+    ) -> Dict[str, Any]:
+        """Merge rows of extracted_data.jsonl that describe the same unit.
+
+        llm resolves cells where the merged rows disagree; when None one is
+        built from the session's value-extraction settings.
+        """
+        from app.services import row_merge
+
+        identity = config.row_identity_columns or []
+        if not identity:
+            logger.warning("Session %s: row merge requested but no row_identity_columns configured", session_id)
+            return {"merged_groups": 0, "error": "no identity columns configured"}
+        session_dir = self.work_dir / session_id
+        table = session_dir / "extracted_data.jsonl"
+        if not table.exists():
+            return {"merged_groups": 0}
+        if llm is None:
+            value_backend = enforce_release_llm_config(
+                config.value_extraction_backend.model_dump(), is_schema_creation=False,
+            )
+            llm = build_llm_interface(
+                provider=value_backend["provider"],
+                model=value_backend["model"],
+                max_output_tokens=value_backend.get("max_output_tokens"),
+                temperature=value_backend["temperature"],
+                api_key=value_backend.get("api_key"),
+                context_window_size=value_backend.get("context_window_size"),
+            )
+        chooser = row_merge.make_llm_chooser(llm, should_stop=lambda: self.is_stop_requested(session_id))
+        summary = await asyncio.to_thread(
+            row_merge.merge_table_file,
+            table, identity, chooser, row_merge.load_column_definitions(session_dir),
+        )
+        message = (
+            f"Merged duplicate rows: {summary['rows_before']} -> {summary['rows_after']} rows "
+            f"({summary['merged_groups']} merged, {summary['suggestions']} near matches to review)"
+        )
+        logger.info("Session %s: %s", session_id, message)
+        await self.websocket_manager.broadcast_log(session_id, {"level": "info", "message": message})
+        return summary
 
     async def _reset_for_observation_unit_rediscovery(self, session_id: str) -> None:
         """Clear schema/data artifacts so a full rediscovery run starts clean."""
@@ -959,6 +1002,9 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
                 await update_progress("Extracting values", 1.0)
                 logger.info("LLM call stats after value extraction: %s", llm_tracker.get_summary())
 
+                if config.merge_duplicate_rows and not self.is_stop_requested(session_id):
+                    await self.merge_duplicate_rows(session_id, config, value_extraction_llm)
+
             # Check for stop after value extraction
             if self.is_stop_requested(session_id):
                 await self._handle_stop_after_extraction(session_id)
@@ -1267,7 +1313,7 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
         data_file = session_dir / "extracted_data.jsonl"
         rows_saved = 0
         if data_file.exists():
-            with open(data_file, 'r') as f:
+            with open(data_file, 'r', encoding='utf-8') as f:
                 rows_saved = sum(1 for _ in f)
         await self._persist_extracted_data(session_id)
         await self.broadcast_stopped(session_id, {

@@ -405,6 +405,11 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
                 logger.info("Upload processing stopped (post-task) for session %s (%d rows saved)", session_id, rows_merged)
                 return
 
+            # New rows describing a unit the table already has (same identity,
+            # e.g. the same NES peptide) are folded into that row instead of
+            # being appended as a duplicate.
+            await self._merge_duplicate_rows_into_table(session_id, output_path, llm, should_stop)
+
             # Merge additional extracted data into main data file
             await self.broadcast_progress(session_id, "Merging extracted data", 0.95, "processing_documents")
             current_session = self.session_manager.get_session(session_id)
@@ -504,6 +509,36 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
             await concurrency_limiter.release(session_id)
     
     
+    async def _merge_duplicate_rows_into_table(self, session_id: str, new_rows_path: Path, llm, should_stop) -> None:
+        """Fold rows of added documents into matching rows of the run's table,
+        when the project has duplicate-row merging enabled. Never raises: on
+        failure the new rows are appended as before."""
+        from app.core.config import DEFAULT_SCHEMATIQ_WORK_DIR
+        from app.services import row_merge
+        from app.services.data_utils import persist_session_data_file
+
+        work_session_dir = Path(DEFAULT_SCHEMATIQ_WORK_DIR) / session_id
+        try:
+            config = json.loads((work_session_dir / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # not a ScheMatiQ run (imported table)
+        identity = config.get("row_identity_columns") or []
+        table = work_session_dir / "extracted_data.jsonl"
+        if not config.get("merge_duplicate_rows") or not identity or not table.exists() or not new_rows_path.exists():
+            return
+        try:
+            await self.broadcast_progress(session_id, "Merging duplicate rows", 0.93, "processing_documents")
+            summary = await asyncio.to_thread(
+                row_merge.merge_table_file,
+                table, identity, row_merge.make_llm_chooser(llm, should_stop),
+                row_merge.load_column_definitions(work_session_dir), new_rows_path,
+            )
+            if summary.get("merged_groups"):
+                await persist_session_data_file(session_id, table)
+            logger.info("Session %s: duplicate-row merge of added documents: %s", session_id, summary)
+        except Exception as e:
+            logger.warning("Session %s: duplicate-row merge failed, appending new rows as-is: %s", session_id, e, exc_info=True)
+
     async def _merge_extracted_data(self, session_id: str, session: VisualizationSession = None) -> int:
         """Merge newly extracted data with existing session data. Returns number of rows added.
 

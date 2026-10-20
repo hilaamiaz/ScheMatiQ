@@ -548,6 +548,56 @@ async def stop_schematiq(session_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class MergeDuplicateRowsRequest(BaseModel):
+    """Optional override of the project's identity columns (priority order)."""
+    identity_columns: Optional[List[str]] = None
+    # Also enable merging for this project's future runs and added documents.
+    remember: bool = True
+
+
+@router.post("/merge-duplicates/{session_id}")
+async def merge_duplicate_rows(session_id: str, request: Optional[MergeDuplicateRowsRequest] = None):
+    """Merge rows of a finished project that describe the same unit.
+
+    Works on the rows already extracted (no document is read again); the LLM
+    only resolves cells where the merged rows disagree. The table is backed up
+    first, and near matches are returned for review instead of being merged.
+    """
+    session = session_manager.get_session(session_id)
+    if not has_live_pipeline(session):
+        raise HTTPException(status_code=404, detail="ScheMatiQ session not found")
+    if session.status == SessionStatus.PROCESSING:
+        raise HTTPException(status_code=409, detail="The project is still running; merge after it finishes.")
+
+    config_file = Path(DEFAULT_SCHEMATIQ_WORK_DIR) / session_id / "config.json"
+    try:
+        config_data = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise HTTPException(status_code=404, detail=f"Project config not found: {e}")
+    if request and request.identity_columns:
+        config_data["row_identity_columns"] = request.identity_columns
+    if not config_data.get("row_identity_columns"):
+        raise HTTPException(status_code=400, detail="No identity columns: pass identity_columns, e.g. [\"NES Sequence\"].")
+    if request is None or request.remember:
+        config_data["merge_duplicate_rows"] = True
+        config_file.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+
+    config = ScheMatiQConfig(**config_data)
+    try:
+        summary = await schematiq_runner.merge_duplicate_rows(session_id, config)
+    except Exception as e:
+        logger.error("Duplicate-row merge failed for %s: %s", session_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Merge failed: {e}")
+    if summary.get("merged_groups"):
+        await schematiq_runner._persist_extracted_data(session_id)
+    suggestions_file = Path(DEFAULT_SCHEMATIQ_WORK_DIR) / session_id / "row_merge_suggestions.json"
+    try:
+        summary["suggestion_details"] = json.loads(suggestions_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        summary["suggestion_details"] = []
+    return summary
+
+
 # NOTE: the unauthenticated "list every session" endpoint was removed here.
 # See the matching note in routes/load.py — the listing exposed every project
 # id on the deployment to any caller, and the frontend never used it.
