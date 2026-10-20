@@ -55,3 +55,77 @@ def set_session_context(session_id: str) -> contextvars.Token:
     current_session_id.reset(token).
     """
     return current_session_id.set(session_id)
+
+
+class _TeeStream:
+    """Write-through copy of a console stream into a log file.
+
+    Catches the library's ``print()`` output, which never reaches a logging
+    handler. The file is line-buffered so nothing is lost if the process dies.
+    """
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log_file = log_file
+
+    def write(self, text):
+        try:
+            self._log_file.write(text)
+        except Exception:
+            pass
+        try:
+            return self._stream.write(text)
+        except UnicodeEncodeError:
+            # A console that can't show e.g. emoji must not crash the caller.
+            enc = getattr(self._stream, "encoding", None) or "ascii"
+            return self._stream.write(text.encode(enc, "replace").decode(enc))
+
+    def flush(self):
+        try:
+            self._log_file.flush()
+        except Exception:
+            pass
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def setup_file_logging(log_dir, formatter: logging.Formatter) -> None:
+    """Mirror all backend output into files under ``log_dir``.
+
+    - ``backend.log``: every log record (root and uvicorn loggers, so request
+      500 tracebacks are included) plus everything printed to stdout/stderr.
+    - ``crash.log``: Python stacks of every thread when the process dies from
+      a native crash (e.g. inside Docling), which produces no Python traceback.
+    """
+    import faulthandler
+    import sys
+    from datetime import datetime
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(
+        log_dir / "backend.log", maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    handler.setFormatter(formatter)
+    handler.addFilter(SessionFilter())
+    logging.getLogger().addHandler(handler)
+    # uvicorn's logger doesn't propagate to root (uvicorn.error propagates
+    # into it), so attach explicitly to catch request 500 tracebacks.
+    logging.getLogger("uvicorn").addHandler(handler)
+
+    prints_file = open(log_dir / "stdout.log", "a", encoding="utf-8", buffering=1)
+    prints_file.write(f"\n===== backend started {datetime.now().isoformat()} =====\n")
+    sys.stdout = _TeeStream(sys.stdout, prints_file)
+    sys.stderr = _TeeStream(sys.stderr, prints_file)
+
+    crash_file = open(log_dir / "crash.log", "a", encoding="utf-8")
+    crash_file.write(f"\n===== backend started {datetime.now().isoformat()} =====\n")
+    crash_file.flush()
+    faulthandler.enable(file=crash_file, all_threads=True)
+    # Keep the handle alive for the life of the process.
+    setup_file_logging._crash_file = crash_file

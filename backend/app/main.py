@@ -31,6 +31,19 @@ logging.basicConfig(
 for _handler in logging.root.handlers:
     _handler.addFilter(SessionFilter())
 
+# Mirror logs, prints and native-crash stacks into backend/logs/ for local runs.
+# On by default except on Railway; BACKEND_LOG_DIR overrides, "" disables.
+_log_dir = os.environ.get(
+    "BACKEND_LOG_DIR",
+    "" if os.environ.get("RAILWAY_ENVIRONMENT") else str(Path(__file__).parent.parent / "logs"),
+)
+if _log_dir:
+    from app.core.logging_utils import setup_file_logging
+    setup_file_logging(
+        _log_dir,
+        logging.Formatter('%(asctime)s %(levelname)s:%(name)s:[%(session_id)s] %(message)s'),
+    )
+
 # Suppress noisy uvicorn access logs (frontend polling every ~3s floods Railway logs)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
