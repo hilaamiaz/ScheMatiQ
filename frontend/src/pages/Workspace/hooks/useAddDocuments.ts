@@ -181,7 +181,12 @@ export function useAddDocuments({
     );
   }, [existingDocNames]);
 
-  const addDocsPending = (addDocsResult?.uploaded_files?.length ?? 0) > 0;
+  // A processing run of added documents that was interrupted (backend
+  // restart, crash, outage) can be started again and continues where it stopped.
+  const addDocsResumable =
+    Boolean(session?.metadata?.pending_extraction) &&
+    session?.status !== 'processing_documents';
+  const addDocsPending = (addDocsResult?.uploaded_files?.length ?? 0) > 0 || addDocsResumable;
 
   return {
     addDocsFiles,
@@ -191,6 +196,7 @@ export function useAddDocuments({
     addDocsError,
     addDocsNotice,
     addDocsPending,
+    addDocsResumable,
     handleAddDocsFilesChange,
     uploadAddDocuments,
     processAddDocuments,

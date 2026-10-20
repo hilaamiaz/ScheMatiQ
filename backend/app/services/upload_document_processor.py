@@ -182,6 +182,19 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
             await self.broadcast_progress(session_id, "Processing documents with AI", 0.3, "processing_documents")
 
             output_path = session_dir / "additional_data.jsonl"
+            # An earlier run over these documents was interrupted (crash, restart,
+            # outage): keep the documents it finished and extract only the rest.
+            # schematiq-lib records finished documents next to the output file.
+            resume = (session_dir / "additional_data_progress.jsonl").exists()
+            if resume:
+                logger.info("Resuming interrupted document processing for session %s", session_id)
+                await self.broadcast_progress(
+                    session_id, "Resuming: documents already extracted are kept", 0.3, "processing_documents"
+                )
+            elif output_path.exists():
+                # Left by an interrupted run without a progress record: its rows
+                # cannot be matched to documents, so set them aside, not merge twice.
+                output_path.replace(session_dir / f"additional_data.stale_{int(time.time())}.jsonl")
 
             # Run extraction in executor to avoid blocking
             # Use get_running_loop() to ensure we have the active event loop
@@ -214,7 +227,7 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
                         output_path=output_path,
                         llm=llm,
                         retriever=retriever,
-                        resume=False,
+                        resume=resume,
                         mode="all",  # Process all columns together
                         retrieval_k=DEFAULT_RETRIEVAL_K,
                         max_workers=1,  # Single worker to avoid overwhelming API
@@ -265,6 +278,7 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
                     # Update session with partial results
                     session = self.session_manager.get_session(session_id)
                     session.status = SessionStatus.STOPPED
+                    session.metadata.pending_extraction = False
                     session.metadata.last_modified = datetime.now()
                     self.session_manager.update_session(session)
 
@@ -361,6 +375,7 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
             if run_state_after is False:
                 session = self.session_manager.get_session(session_id)
                 session.status = SessionStatus.STOPPED
+                session.metadata.pending_extraction = False
                 session.metadata.last_modified = datetime.now()
                 self.session_manager.update_session(session)
 
@@ -403,6 +418,7 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
 
             session.status = SessionStatus.COMPLETED
             session.metadata.last_modified = datetime.now()
+            session.metadata.pending_extraction = False
 
             # Update final statistics using the count returned from merge
             session.metadata.additional_rows_added = rows_added
@@ -663,8 +679,10 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
 
         logger.info(f"Successfully appended {new_rows_added} new rows to session {session_id}. Total rows: {len(original_rows) + new_rows_added}")
 
-        # Clean up the additional data file
+        # Clean up the additional data file (and the resume record of the run
+        # that produced it: its documents are committed below).
         additional_data_file.unlink(missing_ok=True)
+        (session_dir / "additional_data_progress.jsonl").unlink(missing_ok=True)
 
         # Move processed documents (and their per-document artifacts, e.g.
         # figures) from pending_documents/ to documents/ via the shared commit
@@ -822,6 +840,16 @@ class UploadDocumentProcessor(WebSocketBroadcasterMixin):
                 self.running_sessions[session_id] = False
                 return True
             return False
+
+    def mark_starting(self, session_id: str) -> None:
+        """Register a run that was scheduled but has not started yet."""
+        with self._state_lock:
+            self.running_sessions[session_id] = True
+
+    def is_processing(self, session_id: str) -> bool:
+        """True while this process is extracting documents for session_id."""
+        with self._state_lock:
+            return bool(self.running_sessions.get(session_id))
 
     def request_stop(self, session_id: str) -> Dict[str, Any]:
         """Set the stop flag and return immediately."""

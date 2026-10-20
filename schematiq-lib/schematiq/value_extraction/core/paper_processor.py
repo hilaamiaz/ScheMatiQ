@@ -17,6 +17,7 @@ from schematiq.value_extraction.config.messages import (
     NO_UNITS_FOUND, NO_KNOWN_UNITS, KNOWN_UNITS_EMPTY
 )
 from schematiq.core.llm_backends import LLMInterface, _is_invalid_api_key_error
+from schematiq.core.network_resilience import is_transient_error
 from sentence_transformers import util as st_util
 from schematiq.core.llm_call_tracker import LLMCallTracker
 from schematiq.core import utils
@@ -2532,7 +2533,10 @@ class PaperProcessor:
                         feedback=feedback,
                     )
                 except Exception as e:
-                    if _is_invalid_api_key_error(e):
+                    # A bad key, or a network/provider outage, would fail every
+                    # remaining unit too: let the caller wait and retry the whole
+                    # document instead of saving it with units silently missing.
+                    if _is_invalid_api_key_error(e) or is_transient_error(e):
                         raise
                     logger.exception(
                         "[%s] Extraction failed for unit %s, skipping it", paper_title, unit_name

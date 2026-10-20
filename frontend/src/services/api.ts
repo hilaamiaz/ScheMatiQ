@@ -44,6 +44,7 @@ import {
   DocumentListResponse,
 } from '../types/unit';
 import { FilterRule, SortColumn } from '../components/DataTable/types/filters';
+import { extractApiErrorMessage } from '../utils/apiHelpers';
 
 // Railway backend URL - used when env vars aren't set at build time
 const RAILWAY_BACKEND_URL = 'https://backend-production-5a26.up.railway.app';
@@ -243,35 +244,113 @@ export const loadAPI = {
   },
 
   addDocuments: async (sessionId: string, files: File[], bypassLimit = false): Promise<DocumentUploadResult> => {
-    const formData = new FormData();
-    files.forEach(file => {
-      formData.append('files', file);
-    });
+    // Converting a PDF takes ~30s server-side, so one request carrying hundreds
+    // of files would stay open for hours and a single dropped connection would
+    // lose all of it. Send small batches instead, resending a batch whose
+    // request failed for transient reasons (network, timeout, 5xx -- e.g. while
+    // the backend restarts). The server records each converted file as it
+    // goes and caches conversions, so a resent batch only redoes what is missing.
+    const UPLOAD_BATCH_SIZE = 4;
+    const MAX_ATTEMPTS = 15; // ~12 minutes of backoff per batch
 
-    // Files are processed sequentially server-side (incl. PDF figure extraction
-    // via Docling's CPU-based layout/table models), so the default 30s timeout
-    // isn't enough even for a single dense/long paper — one real 9-page paper
-    // measured at ~28s for conversion alone, before request overhead. Scale it
-    // like addCloudDocuments below, but with a much higher floor/per-file rate
-    // since this path does real per-file CPU-bound ML inference, not just a
-    // cloud copy. The floor also has to absorb a cold start: Docling's
-    // DocumentConverter (layout + table-structure models) is a lazy
-    // per-process singleton, so the very first upload after a backend
-    // restart pays extra one-time model-load time on top of conversion —
-    // real single-paper timeouts were observed at the previous 90s floor.
-    const timeoutMs = Math.max(240000, files.length * 60000);
-    const response = await api.post(
-      `/load/add-documents/${sessionId}?bypass_limit=${bypassLimit}`,
-      formData,
-      {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-        timeout: timeoutMs,
+    // When the server caps the document count it keeps the first files it
+    // receives, so shuffle to keep the selection random as with one request.
+    const ordered = [...files];
+    for (let i = ordered.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [ordered[i], ordered[j]] = [ordered[j], ordered[i]];
+    }
+
+    const isTransient = (error: unknown): boolean => {
+      const err = error as { response?: { status?: number }; code?: string };
+      if (!err.response) return true; // network error / timeout / server down
+      const status = err.response.status ?? 0;
+      return status >= 500 || status === 408 || status === 429;
+    };
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const combined: DocumentUploadResult = {
+      status: 'success',
+      message: '',
+      uploaded_files: [],
+      warnings: [],
+      documents_directory: '',
+      document_extraction: {},
+      failed_files: [],
+      errors: [],
+    };
+    let lastBatchError: unknown = null;
+    let failedBatches = 0;
+    const batchCount = Math.ceil(ordered.length / UPLOAD_BATCH_SIZE);
+
+    for (let start = 0; start < ordered.length; start += UPLOAD_BATCH_SIZE) {
+      const batch = ordered.slice(start, start + UPLOAD_BATCH_SIZE);
+      const formData = new FormData();
+      batch.forEach(file => {
+        formData.append('files', file);
+      });
+      // Per-file conversion can take minutes on a dense paper, plus a one-time
+      // model load after a backend restart, so allow a generous timeout.
+      const timeoutMs = Math.max(600000, batch.length * 300000);
+
+      let data: DocumentUploadResult | null = null;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const response = await api.post(
+            `/load/add-documents/${sessionId}?bypass_limit=${bypassLimit}`,
+            formData,
+            {
+              headers: {
+                'Content-Type': 'multipart/form-data',
+              },
+              timeout: timeoutMs,
+            }
+          );
+          data = response.data;
+          break;
+        } catch (error) {
+          if (!isTransient(error) || attempt === MAX_ATTEMPTS) {
+            lastBatchError = error;
+            break;
+          }
+          const waitMs = Math.min(60000, 5000 * 2 ** (attempt - 1));
+          console.warn(
+            `Upload batch ${start / UPLOAD_BATCH_SIZE + 1}/${batchCount} failed ` +
+            `(attempt ${attempt}/${MAX_ATTEMPTS}); retrying in ${waitMs / 1000}s`,
+            error,
+          );
+          await sleep(waitMs);
+        }
       }
-    );
 
-    return response.data;
+      if (!data) {
+        // Either every file of this batch was rejected (4xx) or the server
+        // stayed unreachable. Keep going: the other batches still count.
+        failedBatches++;
+        const detail = extractApiErrorMessage(lastBatchError, 'upload failed');
+        combined.errors!.push(`${batch.map(f => f.name).join(', ')}: ${detail}`);
+        batch.forEach(f => combined.failed_files!.push({ filename: f.name, status: detail }));
+        continue;
+      }
+
+      combined.uploaded_files.push(...(data.uploaded_files || []));
+      combined.warnings.push(...(data.warnings || []));
+      Object.assign(combined.document_extraction!, data.document_extraction || {});
+      combined.failed_files!.push(...(data.failed_files || []));
+      combined.errors!.push(...(data.errors || []));
+      combined.documents_directory = data.documents_directory || combined.documents_directory;
+    }
+
+    if (failedBatches === batchCount && lastBatchError) {
+      throw lastBatchError;
+    }
+
+    combined.message = `Successfully uploaded ${combined.uploaded_files.length} documents`;
+    if (!combined.failed_files!.length) {
+      combined.failed_files = undefined;
+      combined.errors = null;
+    }
+    return combined;
   },
 
   processDocuments: async (sessionId: string, llmConfig?: any): Promise<DocumentProcessingResult> => {

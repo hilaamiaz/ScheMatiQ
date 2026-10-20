@@ -14,7 +14,11 @@ from app.services.pipeline.batch_execution import generate_schema_with_split
 from schematiq.core import schematiq as ScheMatiQ
 from schematiq.core.schema import Schema, Column, ObservationUnit
 from schematiq.core.llm_backends import LLMInterface
+from schematiq.core.llm_backends import _is_invalid_api_key_error
+from schematiq.core.network_resilience import is_transient_error, recover_from_transient_error
 from schematiq import discover_observation_unit, ObservationUnitDiscoveryError
+
+from app.services.pipeline.run_checkpoint import RunCheckpoint
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +34,12 @@ async def run_schema_discovery(
     is_stop_requested: Callable[[str], bool],
     ws_manager=None,
     work_dir: Optional[Path] = None,
+    checkpoint: Optional[RunCheckpoint] = None,
 ):
     """Run real schema discovery using ScheMatiQ pipeline.
+
+    With a checkpoint, the schema is saved after every batch and a rerun of an
+    interrupted discovery continues from the first batch it had not finished.
 
     Args:
         session_id: Session identifier
@@ -44,6 +52,7 @@ async def run_schema_discovery(
         is_stop_requested: Callable that checks if stop was requested
         ws_manager: WebSocket manager for broadcasting schema progress
         work_dir: Working directory for saving partial schemas
+        checkpoint: Progress record used to resume an interrupted discovery
 
     Returns:
         Tuple of (discovered_schema, schema_evolution)
@@ -111,10 +120,68 @@ async def run_schema_discovery(
             pending_observation_unit_name = initial_obs_unit["name"]
             logger.info("Observation unit name pre-configured: %s (definition will be discovered)", pending_observation_unit_name)
 
+    start_batch = 0
+    saved = checkpoint.discovery if checkpoint else None
+    if saved:
+        current_schema = Schema.from_dict(saved["schema"])
+        evolution = SchemaEvolution.model_validate(saved["evolution"])
+        unchanged_count = saved.get("unchanged_count", 0)
+        cumulative_docs = saved.get("cumulative_docs", 0)
+        completion_done = saved.get("completion_done", False)
+        start_batch = saved.get("next_batch", 0)
+        logger.info(
+            "Resuming schema discovery at batch %d/%d with %d columns from the checkpoint",
+            start_batch + 1, len(batches), len(current_schema.columns),
+        )
+        if ws_manager:
+            await ws_manager.broadcast_log(session_id, {
+                "level": "info",
+                "message": (
+                    f"Resuming schema discovery from batch {start_batch + 1}/{len(batches)} "
+                    f"({len(current_schema.columns)} columns already discovered)"
+                ),
+            })
+
+    def _save_checkpoint(next_batch: int) -> None:
+        if checkpoint is None:
+            return
+        checkpoint.save_discovery(
+            next_batch=next_batch,
+            schema_dict=current_schema.to_full_dict(),
+            evolution_dict=evolution.model_dump(mode="json"),
+            unchanged_count=unchanged_count,
+            cumulative_docs=cumulative_docs,
+            completion_done=completion_done,
+        )
+
+    def _stop_requested() -> bool:
+        return is_stop_requested(session_id)
+
+    async def _call_llm(fn):
+        """Run a blocking LLM step, waiting out network/provider outages."""
+        running_loop = asyncio.get_running_loop()
+        attempt = 0
+        while True:
+            try:
+                return await running_loop.run_in_executor(schematiq_thread_pool, fn)
+            except Exception as e:
+                retry = await asyncio.to_thread(
+                    recover_from_transient_error, e, attempt, _stop_requested, logger.warning,
+                )
+                if not retry:
+                    raise
+                attempt += 1
+
+    failed_batches = 0
+    attempted_batches = 0
+
     for iteration, (batch_docs, batch_names) in enumerate(zip(batches, filename_batches)):
+        if iteration < start_batch:
+            continue
         if is_stop_requested(session_id):
             logger.warning("Stop requested during schema discovery - saving partial schema with %d columns", len(current_schema.columns))
             break
+        attempted_batches += 1
 
         logger.debug("Schema discovery batch %d/%d (%d docs: %s)", iteration + 1, len(batches), len(batch_docs), batch_names)
         await progress_callback(f"Schema Discovery: Batch {iteration + 1}/{len(batches)} ({len(batch_docs)} docs)", iteration / len(batches), {
@@ -149,8 +216,7 @@ async def run_schema_discovery(
             logger.info("Discovering observation unit from first batch...")
             try:
                 logger.debug("[%s] Offloading discover_observation_unit to thread pool", session_id)
-                obs_unit = await loop.run_in_executor(
-                    schematiq_thread_pool,
+                obs_unit = await _call_llm(
                     functools.partial(
                         discover_observation_unit,
                         query=query,
@@ -186,8 +252,7 @@ async def run_schema_discovery(
         # Complete any partial user-seeded columns once, with passages as supporting context.
         if not completion_done and any(ScheMatiQ._is_partial(c) for c in current_schema.columns):
             logger.info("Completing partial user-seeded columns (batch %d)", iteration + 1)
-            current_schema.columns = await loop.run_in_executor(
-                schematiq_thread_pool,
+            current_schema.columns = await _call_llm(
                 functools.partial(
                     ScheMatiQ.complete_partial_columns,
                     columns=current_schema.columns,
@@ -223,8 +288,7 @@ async def run_schema_discovery(
                         retriever=retriever,
                     )
                 )
-            result = await loop.run_in_executor(
-                schematiq_thread_pool,
+            result = await _call_llm(
                 functools.partial(
                     ScheMatiQ.generate_schema,
                     passages=sub_content,
@@ -252,8 +316,20 @@ async def run_schema_discovery(
                 notify=_notify_split,
             )
         except Exception as e:
-            logger.error("ERROR in generate_schema: %s", e)
-            raise
+            logger.error("ERROR in generate_schema: %s", e, exc_info=True)
+            # A bad key or a lasting outage would fail every batch: stop the run
+            # (the checkpoint lets a rerun continue from this batch). Any other
+            # failure only costs this batch's contribution to the schema.
+            if _is_invalid_api_key_error(e) or is_transient_error(e):
+                raise
+            failed_batches += 1
+            if ws_manager:
+                await ws_manager.broadcast_log(session_id, {
+                    "level": "warning",
+                    "message": f"Schema discovery batch {iteration + 1}/{len(batches)} failed and was skipped: {str(e)[:200]}",
+                })
+            _save_checkpoint(iteration + 1)
+            continue
 
         if new_schema is None:
             # Entire batch was skipped (all documents exceeded the token limit
@@ -262,6 +338,7 @@ async def run_schema_discovery(
                 "Batch %d/%d produced no schema (all documents skipped for token limits); continuing",
                 iteration + 1, len(batches),
             )
+            _save_checkpoint(iteration + 1)
             continue
 
         logger.debug("Generated schema with %d columns", len(new_schema.columns))
@@ -337,6 +414,7 @@ async def run_schema_discovery(
         # Save partial schema to disk after each batch
         if work_dir:
             _save_partial_schema(current_schema, query, work_dir / session_id)
+        _save_checkpoint(iteration + 1)
 
         # Notify frontend about partial schema availability
         if ws_manager:
@@ -352,6 +430,11 @@ async def run_schema_discovery(
             })
 
         await asyncio.sleep(0.1)
+
+    if attempted_batches and failed_batches == attempted_batches:
+        raise RuntimeError(
+            f"Schema discovery failed on all {attempted_batches} batch(es); see the backend log for the errors"
+        )
 
     logger.debug("Schema discovery completed with %d columns after %d batches", len(current_schema.columns), len(evolution.snapshots))
     logger.debug("Evolution tracking: %d snapshots, %d column sources", len(evolution.snapshots), len(evolution.column_sources))

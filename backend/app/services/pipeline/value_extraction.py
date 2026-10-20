@@ -33,8 +33,14 @@ async def run_value_extraction(
     session_manager,
     work_dir: Path,
     write_artifacts: bool = False,
+    resume: bool = False,
 ) -> List[SkippedDocumentInfo]:
     """Run real value extraction using the value extraction pipeline.
+
+    With resume=True, documents an earlier interrupted run of this session
+    already extracted (recorded next to extracted_data.jsonl) are kept and
+    skipped; otherwise any previous output is moved aside and the run starts
+    clean.
 
     Returns:
         List[SkippedDocumentInfo] for each skip (often LLM ``notes``).
@@ -54,6 +60,12 @@ async def run_value_extraction(
 
     docs_directories = [Path(path) for path in docs_paths]
     output_path = session_dir / "extracted_data.jsonl"
+    if not resume and output_path.exists() and output_path.stat().st_size > 0:
+        # A fresh run appends to this file; keep the old rows aside instead of
+        # mixing them into (and duplicating) the new table.
+        backup = session_dir / f"extracted_data.before_rerun_{int(time.time())}.jsonl"
+        output_path.replace(backup)
+        logger.info("Moved previous extracted data aside to %s", backup.name)
 
     # Count total documents for progress tracking
     total_documents = 0
@@ -88,7 +100,7 @@ async def run_value_extraction(
             output_path=output_path,
             llm=llm,
             retriever=retriever,
-            resume=False,
+            resume=resume,
             mode="all",
             retrieval_k=8,
             max_workers=1,

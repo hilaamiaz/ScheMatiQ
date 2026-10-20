@@ -26,6 +26,11 @@ from app.services.pipeline.config_handler import (
 from app.services.pipeline.schema_discovery import run_schema_discovery
 from app.services.pipeline.error_reporting import describe_llm_error
 from app.services.pipeline.value_extraction import run_value_extraction
+from app.services.pipeline.run_checkpoint import (
+    CHECKPOINT_FILENAME,
+    RunCheckpoint,
+    compute_fingerprint,
+)
 from app.services.pipeline.data_query import (
     compute_statistics, get_status as _get_status, get_schema as _get_schema, get_data as _get_data,
 )
@@ -35,7 +40,7 @@ from app.services.data_utils import purge_session_data_file
 
 logger = logging.getLogger(__name__)
 
-from schematiq.core.schema import ObservationUnit
+from schematiq.core.schema import ObservationUnit, Schema
 from schematiq.core.llm_call_tracker import LLMCallTracker, GlobalLLMUsageTracker, QuotaExceededError
 from schematiq.core.cost_estimator import estimate_from_config
 
@@ -43,6 +48,7 @@ from app.models.schematiq import ScheMatiQConfig, ScheMatiQStatus
 from app.models.session import (
     ColumnInfo, PaginatedData, SessionStatus, SessionType,
     ObservationUnitInfo,
+    SchemaEvolution,
     SkippedDocumentInfo
 )
 from app.services.websocket_manager import WebSocketManager
@@ -480,9 +486,11 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
         session_dir = self.work_dir / session_id
         for fname in (
             "extracted_data.jsonl",
+            "extracted_data_progress.jsonl",
             "discovered_schema.json",
             "value_extraction_schema.json",
             "llm_call_stats.json",
+            CHECKPOINT_FILENAME,
         ):
             artifact = session_dir / fname
             if artifact.exists():
@@ -833,9 +841,26 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
 
             await update_progress("Setting up retriever", 1.0)
 
+            # Progress of an earlier run of this session that was interrupted
+            # (network outage, crash, restart) with the same config and documents.
+            checkpoint = RunCheckpoint(session_dir, compute_fingerprint(schematiq_config, filenames))
+            if checkpoint.has_progress:
+                resume_message = (
+                    "Resuming the interrupted run: "
+                    + ("schema discovery already finished" if checkpoint.discovery_done
+                       else "continuing schema discovery" if checkpoint.discovery
+                       else "continuing value extraction")
+                    + (", already-extracted documents are kept" if checkpoint.extraction_started else "")
+                )
+                logger.info("Session %s: %s", session_id, resume_message)
+                await self.websocket_manager.broadcast_log(session_id, {
+                    "level": "info",
+                    "message": resume_message,
+                })
+
             # Step 5: Observation unit review (optional pause)
             review_observation_unit = schematiq_config.get("review_observation_unit", False)
-            if review_observation_unit and has_documents:
+            if review_observation_unit and has_documents and not checkpoint.has_progress:
                 paused = await self._handle_observation_unit_review(
                     session_id, documents, filenames, schematiq_config, llm, retriever, update_progress
                 )
@@ -846,21 +871,35 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
             current_step += 1
             await update_progress("Discovering schema", 0.0)
 
-            logger.debug("Starting schema discovery with %d documents", len(documents))
-            heartbeat_task = await start_heartbeat(self.websocket_manager, session_id, interval=15.0)
-            try:
-                discovered_schema, schema_evolution = await run_schema_discovery(
-                    session_id, documents, filenames, schematiq_config, llm, retriever,
-                    update_progress, self.is_stop_requested,
-                    ws_manager=self.websocket_manager,
-                    work_dir=self.work_dir,
+            if checkpoint.discovery_done:
+                discovered_schema = Schema.from_dict(checkpoint.discovery["schema"])
+                schema_evolution = SchemaEvolution.model_validate(checkpoint.discovery["evolution"])
+                logger.info(
+                    "Schema discovery already completed by the interrupted run (%d columns); skipping it",
+                    len(discovered_schema.columns),
                 )
-            finally:
-                heartbeat_task.cancel()
+            else:
+                logger.debug("Starting schema discovery with %d documents", len(documents))
+                heartbeat_task = await start_heartbeat(self.websocket_manager, session_id, interval=15.0)
                 try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
+                    discovered_schema, schema_evolution = await run_schema_discovery(
+                        session_id, documents, filenames, schematiq_config, llm, retriever,
+                        update_progress, self.is_stop_requested,
+                        ws_manager=self.websocket_manager,
+                        work_dir=self.work_dir,
+                        checkpoint=checkpoint,
+                    )
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                if not self.is_stop_requested(session_id):
+                    checkpoint.mark_discovery_done(
+                        discovered_schema.to_full_dict(),
+                        schema_evolution.model_dump(mode="json"),
+                    )
 
             logger.debug("Schema discovery completed with %d columns", len(discovered_schema.columns))
             logger.debug("Schema evolution: %d snapshots tracked", len(schema_evolution.snapshots))
@@ -898,6 +937,8 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
                 )
                 logger.debug("Value Extraction LLM interface created successfully")
 
+                resume_extraction = checkpoint.extraction_started
+                checkpoint.mark_extraction_started()
                 heartbeat_task = await start_heartbeat(self.websocket_manager, session_id, interval=15.0)
                 try:
                     skipped_documents = await run_value_extraction(
@@ -906,6 +947,7 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
                         ws_mixin=self, ws_manager=self.websocket_manager,
                         session_manager=self.session_manager, work_dir=self.work_dir,
                         write_artifacts=config.write_artifacts if config.write_artifacts is not None else DEVELOPER_MODE,
+                        resume=resume_extraction,
                     )
                 finally:
                     heartbeat_task.cancel()
@@ -979,6 +1021,23 @@ class ScheMatiQRunner(WebSocketBroadcasterMixin):
                     )
             self.session_manager.update_session(session)
             self.session_manager.capture_schema_baseline(session_id)
+            # Finished: a later rerun of this session starts from scratch --
+            # unless documents failed (e.g. an outage outlasted the retries).
+            # Then the checkpoint stays, so running again redoes only those.
+            failed_docs = [
+                d.document for d in skipped_documents
+                if (d.reason or "").startswith("Extraction failed")
+            ]
+            if failed_docs:
+                await self.websocket_manager.broadcast_log(session_id, {
+                    "level": "warning",
+                    "message": (
+                        f"{len(failed_docs)} document(s) failed and were skipped. "
+                        "Run the project again to retry only those documents."
+                    ),
+                })
+            else:
+                checkpoint.clear()
 
             await update_progress("Finalizing results", 1.0)
 

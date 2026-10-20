@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import shutil
 import traceback
@@ -13,6 +14,7 @@ from tqdm import tqdm
 from schematiq.core.schema import Schema
 from schematiq.core.llm_backends import LLMInterface
 from schematiq.core.results import SkippedDocument
+from schematiq.core.network_resilience import recover_from_transient_error
 from schematiq.core.config import config as lib_config
 from schematiq.value_extraction.config.messages import skipped_summary, DEFAULT_SKIP_REASON, NO_KNOWN_UNITS
 
@@ -181,6 +183,78 @@ class TableBuilder:
         
         return existing_rows, processed_papers, completed_rows
     
+    @staticmethod
+    def _progress_path(output_path: Path) -> Path:
+        """Per-run record of finished documents, used to resume an interrupted run."""
+        return output_path.with_name(f"{output_path.stem}_progress.jsonl")
+
+    def _prepare_progress(self, output_path: Path, resume: bool) -> Set[str]:
+        """Return the names of documents a previous run already finished.
+
+        Without resume, any old progress record is discarded. With resume, rows
+        in output_path that belong to a document not recorded as finished (it
+        was interrupted mid-write) are dropped so the document can be redone
+        without duplicates, and the skip records of finished documents are
+        restored so the final skip report stays complete.
+        """
+        progress_path = self._progress_path(output_path)
+        if not resume:
+            progress_path.unlink(missing_ok=True)
+            return set()
+
+        done: Set[str] = set()
+        if progress_path.exists():
+            with progress_path.open(encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # torn last line from a crash
+                    name = entry.get("paper")
+                    if not name or name in done:
+                        continue
+                    done.add(name)
+                    skip = entry.get("skip")
+                    if skip:
+                        self._skipped_documents.append(SkippedDocument(**skip))
+
+        if output_path.exists():
+            kept, dropped = [], 0
+            with output_path.open(encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        dropped += 1
+                        continue
+                    papers = row.get("_papers") or []
+                    if papers and all(p in done for p in papers):
+                        kept.append(line if line.endswith("\n") else line + "\n")
+                    else:
+                        dropped += 1
+            if dropped:
+                tmp = output_path.with_name(output_path.name + ".tmp")
+                tmp.write_text("".join(kept), encoding="utf-8")
+                os.replace(tmp, output_path)
+                print(f"🔄 Resume: dropped {dropped} row(s) of unfinished documents; they will be redone")
+        return done
+
+    def _mark_paper_done(self, output_path: Path, paper: Path,
+                         skip: Optional[SkippedDocument]) -> None:
+        """Record that paper is fully extracted (its rows are already written)."""
+        entry = {"paper": paper.name, "skip": None}
+        if skip is not None:
+            entry["skip"] = {"document": skip.document, "reason": skip.reason}
+        try:
+            with self._progress_path(output_path).open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:
+            print(f"  ⚠️ Could not record progress for {paper.name}: {e}")
+
     def _create_metadata(self, schema: Schema, docs_directory: Path) -> Dict[str, Any]:
         """Create metadata for row output."""
         return {
@@ -319,12 +393,13 @@ class TableBuilder:
         
         print(f"📊 Found {len(papers_by_row)} unique rows from documents")
         
-        # Handle resume logic
-        existing_rows, processed_papers, completed_rows = {}, set(), set()
-        if resume and output_path.exists():
-            existing_rows, processed_papers, completed_rows = self._load_existing_data(
-                output_path, papers_by_row
-            )
+        # Resume: documents an earlier, interrupted run finished are listed in a
+        # progress file next to the output, and their rows are already in it.
+        existing_rows, completed_rows = {}, set()
+        done_names = self._prepare_progress(output_path, resume)
+        processed_papers = {doc for doc, _ in docs_with_source if doc.name in done_names}
+        if processed_papers:
+            print(f"🔄 Resuming: {len(processed_papers)} document(s) already extracted, skipping them")
         
         # Process rows
         written_rows = set()
@@ -457,102 +532,117 @@ class TableBuilder:
                 )
                 print(f"⏭️  Skipping {paper_title}: not in scope for this run")
                 processed_papers.add(paper)
+                self._mark_paper_done(output_path, paper, self._skipped_documents[-1])
                 continue
 
-            try:
-                paper_text = paper.read_text(encoding="utf-8", errors="ignore")
-                paper_known_units = known_units.get(paper_title) if known_units else None
+            attempt = 0
+            while True:
+                try:
+                    paper_text = paper.read_text(encoding="utf-8", errors="ignore")
+                    paper_known_units = known_units.get(paper_title) if known_units else None
 
-                if self.on_document_started:
-                    try:
-                        # Advance the progress counter by the number of observation
-                        # units this document actually contributes, not by 1 file --
-                        # a document can hold more than one known unit, and the
-                        # caller expresses total_documents in units once known_units
-                        # is in play (see reextraction_service._run_reextraction).
-                        unit_count_hint = len(paper_known_units) if paper_known_units else 1
-                        self.on_document_started(paper_title, unit_count_hint)
-                    except Exception:
-                        pass
-
-                print(f"🔍 Processing {paper_title} for observation units ({observation_unit.name})...")
-
-                # Extract values with observation units (may return multiple rows)
-                paper_unit_targets = unit_targets_by_paper.get(paper_title) if unit_targets_by_paper else None
-                extraction_result = self.paper_processor.extract_values_for_paper_with_units(
-                    paper_title=paper_title,
-                    paper_text=paper_text,
-                    schema=schema,
-                    max_new_tokens=max_new_tokens,
-                    mode="all",
-                    retrieval_k=retrieval_k,
-                    known_units=paper_known_units,
-                    unit_targets=paper_unit_targets,
-                    figures_dir=source_dir / "figures" / paper.stem,
-                    feedback=feedback,
-                )
-                unit_rows = extraction_result.rows
-                skip_reason = extraction_result.skip_reason
-
-                if self.should_stop and self.should_stop():
-                    self._stopped = True
-                    return
-
-                # Track documents with no observation units found (distinct from "units found but no cells extracted")
-                if not unit_rows and skip_reason:
-                    self._skipped_documents.append(
-                        SkippedDocument(
-                            document=paper_title,
-                            reason=skip_reason.strip() or DEFAULT_SKIP_REASON,
-                        )
-                    )
-
-                # Write each unit row
-                for unit_row in unit_rows:
-                    # Add metadata
-                    unit_name = unit_row.get("_unit_name", paper_title)
-                    unit_row["_row_name"] = unit_name  # Use unit name as row name
-                    unit_row["_papers"] = [paper.name]
-                    unit_row["document_directory"] = str(source_dir)
-                    unit_row["_metadata"] = {
-                        "query": schema.query,
-                        "source_directories": [str(source_dir)],
-                        "observation_unit": observation_unit.name,
-                        "base_row_name": row_name,
-                    }
-
-                    # Write row if it has actual data columns
-                    if any(key for key in unit_row.keys() if not key.startswith('_') and key != "document_directory"):
+                    if self.on_document_started and attempt == 0:
                         try:
-                            with output_path.open('a', encoding="utf-8") as f_out:
-                                f_out.write(json.dumps(unit_row, ensure_ascii=False) + "\n")
-                            total_units_written += 1
-                            print(f"  ✅ Wrote unit row: {unit_name}")
+                            # Advance the progress counter by the number of observation
+                            # units this document actually contributes, not by 1 file --
+                            # a document can hold more than one known unit, and the
+                            # caller expresses total_documents in units once known_units
+                            # is in play (see reextraction_service._run_reextraction).
+                            unit_count_hint = len(paper_known_units) if paper_known_units else 1
+                            self.on_document_started(paper_title, unit_count_hint)
+                        except Exception:
+                            pass
 
-                            # Notify callbacks
-                            if self.on_unit_row_written:
-                                try:
-                                    self.on_unit_row_written(dict(unit_row))
-                                except Exception as cb_err:
-                                    print(f"  ⚠️ on_unit_row_written callback error: {cb_err}")
-                            if self.on_value_extracted:
-                                for col_name, col_value in unit_row.items():
-                                    if not col_name.startswith('_') and col_name != "document_directory":
-                                        self.on_value_extracted(unit_name, col_name, col_value)
+                    print(f"🔍 Processing {paper_title} for observation units ({observation_unit.name})...")
 
-                        except Exception as e:
-                            print(f"  ❌ Failed to write unit row {unit_name}: {e}")
+                    # Extract values with observation units (may return multiple rows)
+                    paper_unit_targets = unit_targets_by_paper.get(paper_title) if unit_targets_by_paper else None
+                    extraction_result = self.paper_processor.extract_values_for_paper_with_units(
+                        paper_title=paper_title,
+                        paper_text=paper_text,
+                        schema=schema,
+                        max_new_tokens=max_new_tokens,
+                        mode="all",
+                        retrieval_k=retrieval_k,
+                        known_units=paper_known_units,
+                        unit_targets=paper_unit_targets,
+                        figures_dir=source_dir / "figures" / paper.stem,
+                        feedback=feedback,
+                    )
+                    unit_rows = extraction_result.rows
+                    skip_reason = extraction_result.skip_reason
 
-                processed_papers.add(paper)
+                    if self.should_stop and self.should_stop():
+                        self._stopped = True
+                        return
 
-            except Exception as e:
-                # One bad document must not end a long run: record it as
-                # skipped (so it shows up in the skip report) and move on.
-                traceback.print_exc()
-                print(f"⚠️  Error processing {paper.name} for observation units, skipping it: {e}")
-                self._skipped_documents.append(
-                    SkippedDocument(document=paper_title, reason=f"Extraction failed: {e}")
-                )
+                    # Track documents with no observation units found (distinct from "units found but no cells extracted")
+                    if not unit_rows and skip_reason:
+                        self._skipped_documents.append(
+                            SkippedDocument(
+                                document=paper_title,
+                                reason=skip_reason.strip() or DEFAULT_SKIP_REASON,
+                            )
+                        )
+
+                    # Write each unit row
+                    for unit_row in unit_rows:
+                        # Add metadata
+                        unit_name = unit_row.get("_unit_name", paper_title)
+                        unit_row["_row_name"] = unit_name  # Use unit name as row name
+                        unit_row["_papers"] = [paper.name]
+                        unit_row["document_directory"] = str(source_dir)
+                        unit_row["_metadata"] = {
+                            "query": schema.query,
+                            "source_directories": [str(source_dir)],
+                            "observation_unit": observation_unit.name,
+                            "base_row_name": row_name,
+                        }
+
+                        # Write row if it has actual data columns
+                        if any(key for key in unit_row.keys() if not key.startswith('_') and key != "document_directory"):
+                            try:
+                                with output_path.open('a', encoding="utf-8") as f_out:
+                                    f_out.write(json.dumps(unit_row, ensure_ascii=False) + "\n")
+                                total_units_written += 1
+                                print(f"  ✅ Wrote unit row: {unit_name}")
+
+                                # Notify callbacks
+                                if self.on_unit_row_written:
+                                    try:
+                                        self.on_unit_row_written(dict(unit_row))
+                                    except Exception as cb_err:
+                                        print(f"  ⚠️ on_unit_row_written callback error: {cb_err}")
+                                if self.on_value_extracted:
+                                    for col_name, col_value in unit_row.items():
+                                        if not col_name.startswith('_') and col_name != "document_directory":
+                                            self.on_value_extracted(unit_name, col_name, col_value)
+
+                            except Exception as e:
+                                print(f"  ❌ Failed to write unit row {unit_name}: {e}")
+
+                    processed_papers.add(paper)
+                    self._mark_paper_done(
+                        output_path, paper,
+                        self._skipped_documents[-1] if (not unit_rows and skip_reason) else None,
+                    )
+                    break
+
+                except Exception as e:
+                    # A network/provider outage: wait for it to pass and redo
+                    # this document rather than skipping it.
+                    if recover_from_transient_error(e, attempt, self.should_stop):
+                        attempt += 1
+                        continue
+                    # One bad document must not end a long run: record it as
+                    # skipped (so it shows up in the skip report) and move on.
+                    # It is not marked done, so a resumed run tries it again.
+                    traceback.print_exc()
+                    print(f"⚠️  Error processing {paper.name} for observation units, skipping it: {e}")
+                    self._skipped_documents.append(
+                        SkippedDocument(document=paper_title, reason=f"Extraction failed: {e}")
+                    )
+                    break
 
         # Mark original row_name as written if any units were written
         if total_units_written > 0:

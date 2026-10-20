@@ -444,6 +444,16 @@ async def get_session(session_id: str):
     session = session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    if (
+        session.status == SessionStatus.PROCESSING_DOCUMENTS
+        and session.metadata.pending_extraction
+        and not upload_processor.is_processing(session_id)
+    ):
+        # Left "processing" by a run that died with the backend (crash,
+        # restart). Report it as stopped so the UI offers to resume it.
+        session.status = SessionStatus.STOPPED
+        session.error_message = "Document processing was interrupted. Process the documents again to resume."
+        session_manager.update_session(session)
     return session
 
 @router.delete("/sessions/{session_id}")
@@ -833,9 +843,32 @@ async def extract_schema(session_id: str, query: str = ""):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# Serializes uploads per session. The frontend sends a large upload in small
+# batches and resends a batch whose request failed; if the server was still
+# working on the original request, the resend waits for it here and then finds
+# the files already converted, instead of converting them concurrently.
+_add_documents_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _merge_unique(existing: List[str], new: List[str]) -> List[str]:
+    seen = set(existing)
+    merged = list(existing)
+    for name in new:
+        if name not in seen:
+            seen.add(name)
+            merged.append(name)
+    return merged
+
+
 @router.post("/add-documents/{session_id}", response_model=dict)
 async def add_documents(session_id: str, files: List[UploadFile] = File(...), bypass_limit: bool = Query(False)):
     """Upload documents for processing with extracted schema."""
+    lock = _add_documents_locks.setdefault(session_id, asyncio.Lock())
+    async with lock:
+        return await _add_documents_locked(session_id, files, bypass_limit)
+
+
+async def _add_documents_locked(session_id: str, files: List[UploadFile], bypass_limit: bool):
     from app.core.config import MAX_DOCUMENTS, DEVELOPER_MODE
 
     try:
@@ -853,7 +886,11 @@ async def add_documents(session_id: str, files: List[UploadFile] = File(...), by
         )
         is_valid_schematiq_session = (
             has_live_pipeline(session) and
-            session.status in [SessionStatus.CREATED, SessionStatus.COMPLETED, SessionStatus.STOPPED]
+            session.status in [
+                SessionStatus.CREATED, SessionStatus.COMPLETED, SessionStatus.STOPPED,
+                # A later batch of the same (batched) upload.
+                SessionStatus.DOCUMENTS_UPLOADED,
+            ]
         )
 
         if not (is_valid_upload_session or is_valid_schematiq_session):
@@ -866,7 +903,8 @@ async def add_documents(session_id: str, files: List[UploadFile] = File(...), by
         valid_files = [f for f in files if not _is_system_file(f.filename)]
         system_files = [f for f in files if _is_system_file(f.filename)]
 
-        existing_count = len(session.metadata.uploaded_documents or [])
+        already_received = set(session.metadata.uploaded_documents or [])
+        existing_count = len(already_received)
         new_count = len(valid_files)
         total_count = existing_count + new_count
 
@@ -895,6 +933,14 @@ async def add_documents(session_id: str, files: List[UploadFile] = File(...), by
             valid_files = valid_files[:available_slots]
             limit_applied = True
             logger.debug(f"Document limit applied. Selected {len(valid_files)} of {new_count} files (max {MAX_DOCUMENTS}, existing {existing_count})")
+        elif enforce_limit and available_slots <= 0 and new_count > 0:
+            # Session already full (a later batch of a batched upload).
+            valid_files = [
+                f for f in valid_files
+                if Path(f.filename).stem + ".txt" in already_received
+            ]
+            limit_applied = True
+            logger.debug(f"Document limit reached ({MAX_DOCUMENTS}); ignoring {new_count - len(valid_files)} new files")
 
         # Reconstruct files list: valid (possibly trimmed) + system files
         files = valid_files + system_files
@@ -963,6 +1009,10 @@ async def add_documents(session_id: str, files: List[UploadFile] = File(...), by
                     continue
 
                 uploaded_filenames.append(display_name)
+                session.metadata.uploaded_documents = _merge_unique(
+                    session.metadata.uploaded_documents or [], [display_name]
+                )
+                session_manager.update_session(session)
                 logger.debug(f"Saved file to pending: {file_path}")
 
             except Exception as e:
@@ -978,7 +1028,7 @@ async def add_documents(session_id: str, files: List[UploadFile] = File(...), by
         
         # Update session metadata — append new filenames to any already queued
         existing_docs = session.metadata.uploaded_documents or []
-        session.metadata.uploaded_documents = existing_docs + uploaded_filenames
+        session.metadata.uploaded_documents = _merge_unique(existing_docs, uploaded_filenames)
         # Track stems so PubMed enrichment skips user-uploaded documents
         existing_stems = set(session.metadata.pubmed_link_suppressed_stems)
         for fn in uploaded_filenames:
@@ -1380,8 +1430,15 @@ async def process_documents(session_id: str, background_tasks: BackgroundTasks, 
             has_live_pipeline(session) and
             session.status in [SessionStatus.COMPLETED, SessionStatus.DOCUMENTS_UPLOADED]
         )
+        # An earlier processing run of added documents was interrupted (crash,
+        # backend restart, outage): it may be started again, whatever status it
+        # was left in, and continues where it stopped.
+        is_interrupted_run = bool(session.metadata.pending_extraction) and not upload_processor.is_processing(session_id)
 
-        if not (is_valid_upload_session or is_valid_schematiq_session):
+        if session.status == SessionStatus.PROCESSING_DOCUMENTS and upload_processor.is_processing(session_id):
+            raise HTTPException(status_code=409, detail="These documents are already being processed.")
+
+        if not (is_valid_upload_session or is_valid_schematiq_session or is_interrupted_run):
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot process documents for session type '{session.type}' in status '{session.status}'. Sessions need documents uploaded or be completed."
@@ -1428,6 +1485,8 @@ async def process_documents(session_id: str, background_tasks: BackgroundTasks, 
         
         # Update session status
         session.status = SessionStatus.PROCESSING_DOCUMENTS
+        session.metadata.pending_extraction = True
+        session.error_message = None
         session.metadata.last_modified = datetime.now()
         session.metadata.original_row_count = session.statistics.total_rows if session.statistics else 0
         
@@ -1455,6 +1514,9 @@ async def process_documents(session_id: str, background_tasks: BackgroundTasks, 
         await concurrency_limiter.acquire(session_id, "upload_extraction")
 
         # Start processing in background
+        # Counted as running from now, so the session is not mistaken for an
+        # interrupted run before the background task starts.
+        upload_processor.mark_starting(session_id)
         background_tasks.add_task(upload_processor.process_documents, session_id)
 
         logger.debug(f"Document processing started in background for session: {session_id}")

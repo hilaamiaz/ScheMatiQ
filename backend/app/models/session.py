@@ -128,6 +128,9 @@ class SessionMetadata(BaseModel):
     processing_stats: Dict[str, Any] = Field(default_factory=dict)  # Document processing statistics
     original_row_count: Optional[int] = None  # Original uploaded data row count
     additional_rows_added: int = 0  # Rows added through document processing
+    # Added documents whose extraction started but has not been merged into the
+    # table yet (run interrupted). Processing them again resumes that run.
+    pending_extraction: bool = False
     cloud_dataset: Optional[str] = None  # Original cloud dataset name (e.g., "nes_full_text")
     document_metadata: Dict[str, Dict[str, Any]] = Field(default_factory=dict)  # Per-document metadata: filename -> { "url": str, ... }
     # Stems of user-uploaded files — never attach PubMed/EuropePMC URLs to these

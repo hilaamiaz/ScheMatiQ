@@ -624,6 +624,7 @@ function Workspace() {
     addDocsError,
     addDocsNotice,
     addDocsPending,
+    addDocsResumable,
     handleAddDocsFilesChange,
     uploadAddDocuments,
     processAddDocuments,
@@ -1573,7 +1574,9 @@ function Workspace() {
                     >
                       {addDocsProcessing
                         ? 'Starting extraction\u2026'
-                        : `Process ${addDocsResult?.uploaded_files?.length ?? 0} new document(s)`}
+                        : addDocsResumable && !addDocsResult?.uploaded_files?.length
+                          ? 'Resume processing (continues where it stopped)'
+                          : `Process ${addDocsResult?.uploaded_files?.length ?? 0} new document(s)`}
                     </Button>
                   )}
                 </div>

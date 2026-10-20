@@ -120,6 +120,8 @@ export interface SessionMetadata {
   processing_stats?: ProcessingStats;
   original_row_count?: number;
   additional_rows_added?: number;
+  // Processing of added documents was interrupted; processing again resumes it.
+  pending_extraction?: boolean;
   cloud_dataset?: string;
   document_metadata?: Record<string, DocumentExtractionInfo>;
 }

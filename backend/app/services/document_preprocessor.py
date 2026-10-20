@@ -405,6 +405,29 @@ def preprocess_uploaded_file(
     pending_dir = source_path.parent
     final_output = pending_dir / f"{source_path.stem}.txt"
     figures_dir = documents_dir if documents_dir is not None else pending_dir
+    persisted_stem = figure_stem or final_output.stem
+
+    # The same file converted before (e.g. an upload retried after a dropped
+    # connection): reuse that result instead of converting again.
+    from app.services import conversion_cache
+    cache_key = None
+    try:
+        cache_key = conversion_cache.cache_key(source_path, orig_name, persisted_stem)
+    except OSError as e:
+        logger.warning("Could not hash %s for the conversion cache: %s", source_path.name, e)
+    cached = conversion_cache.restore(cache_key, final_output, figures_dir / "figures" / persisted_stem)
+    if cached is not None:
+        if source_path != final_output:
+            source_path.unlink(missing_ok=True)
+        logger.info("Reused cached conversion of %s", orig_name)
+        return ExtractionResult(
+            output_path=final_output,
+            display_name=final_output.name,
+            method=cached.get("method", "pdf"),
+            status=cached.get("status", "extracted from pdf"),
+            success=True,
+            original_filename=orig_name,
+        )
 
     figure_build = None
     if ext == ".pdf":
@@ -445,9 +468,21 @@ def preprocess_uploaded_file(
         if source_path != final_output:
             source_path.unlink(missing_ok=True)
 
+        persisted_figures = None
         if figure_build is not None:
             from app.services.figure_extraction_service import persist_figures
-            persist_figures(figure_build, figures_dir, figure_stem or final_output.stem, source_document=orig_name)
+            persisted_figures = persist_figures(figure_build, figures_dir, persisted_stem, source_document=orig_name)
+
+        # Only cache complete results: a failed or unverified figure pass
+        # should be redone when the file is uploaded again.
+        if cache_key and (
+            figure_build is None
+            or (getattr(figure_build, "status", None) == "ok" and not getattr(figure_build, "degraded", False))
+        ):
+            conversion_cache.store(
+                cache_key, final_output, persisted_figures,
+                {"method": method_key, "status": status, "original_filename": orig_name},
+            )
 
         return ExtractionResult(
             output_path=final_output,

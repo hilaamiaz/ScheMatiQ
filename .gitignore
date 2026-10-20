@@ -62,6 +62,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Local cache of converted uploads (backend/app/services/conversion_cache.py)
+backend/conversion_cache/
+
 # Temporary files
 tmp/
 temp/

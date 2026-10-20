@@ -74,6 +74,9 @@ class _FigureBuildResult:
     tmp_dir: Path
     status: Literal["ok", "failed"]
     error: Optional[str] = None
+    # Some caption-verification calls failed (e.g. network outage), so the
+    # captions are Docling's unverified ones. Usable, but not worth caching.
+    degraded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +377,15 @@ def _get_genai_client():
     return genai.Client(api_key=get_gemini_api_key())
 
 
+# Counts verification calls that failed on the current thread, so
+# extract_figures can tell a verified result from a best-effort fallback.
+_verification_state = threading.local()
+
+
+def _note_verification_failure() -> None:
+    _verification_state.failures = getattr(_verification_state, "failures", 0) + 1
+
+
 def _verify_figure_caption(
     image_bytes: bytes, mime_type: str, caption: str
 ) -> Tuple[bool, Optional[str]]:
@@ -410,6 +422,7 @@ def _verify_figure_caption(
         data = json.loads(response.text)
         return bool(data.get("matches")), (data.get("description") or None)
     except Exception:
+        _note_verification_failure()
         return True, None
 
 
@@ -483,6 +496,7 @@ def _rematch_orphaned_figures(
                 used_labels.add(chosen_label)
         return result
     except Exception:
+        _note_verification_failure()
         return fallback
 
 
@@ -686,6 +700,7 @@ def extract_figures(pdf_path: Path, documents_dir: Path, *, source_document: str
         logger.warning("Figure extraction failed for %s: %s", pdf_path.name, e)
         return _FigureBuildResult([], tmp_dir, status="failed", error=str(e))
 
+    _verification_state.failures = 0
     try:
         # Best-effort on its own: a bug/failure here must not discard an
         # otherwise-successful extraction (_verify_and_rematch_captions
@@ -693,9 +708,10 @@ def extract_figures(pdf_path: Path, documents_dir: Path, *, source_document: str
         # guard against a bug in the orchestration itself).
         figures = _verify_and_rematch_captions(figures, tmp_dir)
     except Exception:
-        pass
+        _note_verification_failure()
 
-    return _FigureBuildResult(figures, tmp_dir, status="ok", error=None)
+    degraded = getattr(_verification_state, "failures", 0) > 0
+    return _FigureBuildResult(figures, tmp_dir, status="ok", error=None, degraded=degraded)
 
 
 def persist_figures(
