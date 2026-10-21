@@ -20,7 +20,7 @@ Usage (from the repo root):
         [--llm-judge] [--include-uncited] [--include-doubt] [--refresh]
 
 --llm-judge sends free-text cells the rules call a miss (evidence, secondary structure, other
-residues) to Gemini (GEMINI_API_KEY from backend/.env) and saves each verdict, so re-runs are free.
+residues, and mutations written in words) to Gemini (GEMINI_API_KEY from backend/.env) and saves each verdict, so re-runs are free.
 
 Fields for --map: name, alt_names, organism, uniprot, evidence, mutations,
 mutations_export, mutations_crm1, signals, secondary_structure, other_residues,
@@ -32,6 +32,7 @@ import csv
 import html
 import json
 import re
+import statistics
 import sys
 import time
 from collections import defaultdict
@@ -80,7 +81,20 @@ EXACT_HEADERS = {"alternative names": "alt_names", "sequence": "sequence", "unip
 GREEK = {"α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "ε": "epsilon", "κ": "kappa", "λ": "lambda", "μ": "mu", "σ": "sigma"}
 STOPWORDS = {"the", "a", "an", "of", "and", "or", "in", "to", "with", "by", "for", "is", "was", "on", "at", "as", "protein"}
 AA_RE = re.compile(r"[ACDEFGHIKLMNPQRSTVWY]{6,}")
-MUTATION_RE = re.compile(r"\b([A-Z])(\d{1,4})([A-Z])\b")
+THREE_LETTER = {"ala": "A", "arg": "R", "asn": "N", "asp": "D", "cys": "C", "gln": "Q", "glu": "E", "gly": "G",
+                "his": "H", "ile": "I", "leu": "L", "lys": "K", "met": "M", "phe": "F", "pro": "P", "ser": "S",
+                "thr": "T", "trp": "W", "tyr": "Y", "val": "V"}
+_AA3 = "|".join(THREE_LETTER)
+# Leu308Ala, Leu-544 to Ala, L619-A, L300->R, L172A
+MUTATION3_RE = re.compile(rf"\b({_AA3})[\s\-]?(\d{{1,4}})\s*(?:to|->|→|>|-)?\s*({_AA3})\b", re.I)
+MUTATION_RE = re.compile(r"\b([A-Z])-?(\d{1,4})\s*(?:->|→|>|-)?\s*([A-Z])\b")
+# L348/352A, L348,352A and 14,16L->A: one substitution applied at several positions
+MUTATION_LIST_RE = re.compile(r"\b([A-Z])?(\d{1,4}(?:\s*[/,]\s*\d{1,4})+)\s*([A-Z])?\s*(?:->|→|>|to)?\s*([A-Z])\b")
+ORGANISM_ADJECTIVES = {"canine": "dog", "murine": "mouse", "porcine": "pig", "equine": "horse",
+                       "feline": "cat", "ovine": "sheep", "simian": "monkey"}
+GENERIC_NAME_WORDS = {"kinase", "factor", "receptor", "domain", "subunit", "homolog", "transcription factor",
+                      "protein kinase", "nes", "complex", "enzyme", "helicase", "phosphatase"}
+GENERIC_ORGANISM_WORDS = {"virus", "cells", "cell", "strain", "mammal", "mammalian", "in vitro", "yeast cells"}
 RANGE_RE = re.compile(r"(\d{1,4})\s*(?:-|–|—|to|\.\.)\s*(\d{1,4})")
 UNIPROT_RE = re.compile(r"\b([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})\b")
 
@@ -97,7 +111,7 @@ def parse_details(page_html: str) -> dict:
         key = " ".join(head.get_text(" ", strip=True).split()).lower()
         if key == "full name":
             link = content.find("a", class_="swiss")
-            entry["uniprot"] = link["href"].rstrip("/").split("/")[-1] if link else ""
+            entry["uniprot"] = link["href"].strip().rstrip("/").split("/")[-1] if link else ""
         if key == "sequence":
             fasta = content.find("pre", id="toggleFasta")
             entry["sequence"] = "".join(fasta.get_text().splitlines()[1:]).strip() if fasta else ""
@@ -178,7 +192,8 @@ def tokens(text) -> set[str]:
 
 
 def has_value(value) -> bool:
-    return norm(value) not in NO_VALUE
+    n = norm(value)  # "unknown (NES not included in PDB)" records nothing to recover either
+    return n not in NO_VALUE and not n.startswith("unknown ")
 
 
 def entry_names(entry: dict) -> list[str]:
@@ -223,23 +238,79 @@ def cmp_text(field):
     return compare
 
 
+def organism_text(text) -> str:
+    v = norm(text)
+    v = re.sub(r"\btype (\d)", r"\1", v)  # "herpes simplex virus type 1" = "... virus 1"
+    return ORGANISM_ADJECTIVES.get(v, v)
+
+
 def cmp_organism(value, entry, args):
     truth = entry.get("organism", "")
     if not has_value(truth):
         return truth, None
-    parts = [p for p in (norm(x) for x in re.split(r"[()]", truth)) if p]
-    v = norm(value)
-    return truth, bool(v) and any(p in v or v in p for p in parts)
+    parts = [p for p in (organism_text(x) for x in re.split(r"[()]", truth)) if p]
+    v = organism_text(value)
+    # The value may itself be "Name (abbrev)" or "Mouse / Human"; any substantial piece may carry the species.
+    pieces = [v] + [p for p in (organism_text(x) for x in re.split(r"[()/,;]", value))
+                    if len(p) >= 4 and p not in GENERIC_ORGANISM_WORDS]
+    return truth, bool(v) and any(p in q or q in p for p in parts for q in pieces)
+
+
+def compact_name(text) -> set[str]:
+    """Spelling variants of a name with spaces dropped: Greek letters as words and as letters (IκBα = IkBa)."""
+    raw = html.unescape(str(text or "")).lower()
+    short = raw
+    for g, word in GREEK.items():
+        short = short.replace(g, word[0])
+    return {re.sub(r"[^a-z0-9]+", "", norm(raw)), re.sub(r"[^a-z0-9]+", "", short)}
 
 
 def cmp_names(value, entry, args):
-    names = entry_names(entry)
-    items = [norm(x) for x in re.split(r"[,;/|]", value)] + [norm(value)]
-    return "; ".join([entry.get("name", ""), entry.get("alt_names", "")]).strip("; "), any(i and i in names for i in items)
+    truth = "; ".join([entry.get("name", ""), entry.get("alt_names", "")]).strip("; ")
+    raw_names = [entry.get("full_name", "")] + re.split(r"[,;/]", f"{entry.get('name', '')};{entry.get('alt_names', '')}")
+    names = [n for n in raw_names if norm(n) and norm(n) not in NO_VALUE]
+    variants = set().union(*(compact_name(n) for n in names)) if names else set()
+    # NESdb runs several alternative names together ("Protein kinase B (PKB) Protein kinase B alpha ..."),
+    # so a CSV name also counts when it appears as a whole phrase inside one of them - a single word only
+    # when the rest of that name is generic ("APC" in "APC Protein"), so "ERK" does not match "ERK kinase 1".
+    padded = [f" {norm(n)} " for n in names]
+    generic = STOPWORDS | GENERIC_NAME_WORDS | {"protein", "transcription"}
+    items = [x for x in re.split(r"[,;/|]", value) if norm(x)] + [value]
+    for item in items:
+        n = norm(item)
+        if n in NO_VALUE or n in STOPWORDS or n in GENERIC_NAME_WORDS:
+            continue
+        if compact_name(item) & variants:
+            return truth, True
+        if " " in n and any(f" {n} " in p for p in padded):
+            return truth, True
+        if len(n) >= 3 and any(f" {n} " in p and set(p.replace(f" {n} ", " ", 1).split()) <= generic for p in padded):
+            return truth, True
+        # "Mek1 kinase" vs "MEK1": a one-word NESdb name inside the CSV name.
+        if any(len(m) >= 3 and " " not in m and f" {m} " in f" {n} " for m in (norm(x) for x in names)):
+            return truth, True
+    return truth, False
 
 
-def mutation_set(text: str) -> set[str]:
-    return {"".join(m) for m in MUTATION_RE.findall(text or "")}
+def mutation_set(text: str) -> set[tuple[str, str]]:
+    """(position, new residue) of each substitution in any common notation. The original residue is left out
+    so that a residue NESdb or the paper names differently at the same position still counts."""
+    text = text or ""
+    found = {(pos, THREE_LETTER[new.lower()]) for _, pos, new in MUTATION3_RE.findall(text)}
+    found |= {(pos, new) for _, pos, new in MUTATION_RE.findall(text)}
+    for _, positions, _, new in MUTATION_LIST_RE.findall(text):
+        found |= {(pos, new) for pos in re.findall(r"\d+", positions)}
+    return found
+
+
+def residues(value: str) -> str:
+    """The value as one run of residues when it is nothing but a peptide - spaced ("L V V L"), numbered
+    ("L165AGKM169SNLVL174"), starred or in three-letter code ("Cys-Gly-Gln") - else ''."""
+    words = re.findall(r"[A-Za-z]+", value)
+    if words and re.fullmatch(rf"(?:(?:{_AA3})[\s\-]*)+", value.strip(), re.I):
+        return "".join(THREE_LETTER[w.lower()] for w in re.findall(_AA3, value, re.I))
+    compact = re.sub(r"[\s\-\*\d]+", "", value)
+    return compact if len(compact) >= 5 and re.fullmatch(r"[ACDEFGHIKLMNPQRSTVWY]+", compact) else ""
 
 
 def cmp_mutations(fields):
@@ -261,7 +332,8 @@ def cmp_signals(value, entry, args):
     truth = ", ".join(f"{s['start']}-{s['end']} {s['seq']}" for s in signals) or entry.get("signals_text", "")
     if not signals:
         return truth, None
-    seqs = AA_RE.findall(value.upper())
+    whole = residues(value)
+    seqs = [whole] if whole else AA_RE.findall(value.upper())
     for s in signals:
         for seq in seqs:
             short = min(len(seq), len(s["seq"]))
@@ -277,14 +349,14 @@ def cmp_sequence(value, entry, args):
     truth = entry.get("sequence", "")
     if not truth:
         return "", None
-    seq = "".join(AA_RE.findall(value.upper()))
+    seq = residues(value) or "".join(AA_RE.findall(value.upper()))
     if seq and len(seq) < 50:  # an NES, not the whole protein
         return cmp_signals(value, entry, args)
     return truth[:30] + "...", bool(seq) and (seq in truth or truth in seq)
 
 
 def cmp_uniprot(value, entry, args):
-    truth = entry.get("uniprot", "")
+    truth = entry.get("uniprot", "").strip()  # older caches kept the link's trailing newline
     if not truth:
         return truth, None
     return truth, truth.split("-")[0] in {u.split("-")[0] for u in UNIPROT_RE.findall(value.upper())}
@@ -316,7 +388,18 @@ COMPARATORS = {
 
 # ---------------------------------------------------------------- LLM judge
 
-LLM_FIELDS = ("evidence", "secondary_structure", "other_residues")
+LLM_FIELDS = ("evidence", "secondary_structure", "other_residues", "mutations", "mutations_export", "mutations_crm1")
+# Field-specific rules appended to the prompt.
+LLM_HINTS = {
+    "evidence": " A bare \"yes\", a list of numbers, or a value that only says the protein or signal is exported, "
+                "without naming the kind of evidence NESdb records (e.g. LMB sensitivity, CRM1 binding, crm1/Xpo1 "
+                "mutant, competition with other CRM1 cargos), is too vague.",
+    "mutations": " It is a match only if the extracted value describes at least one of the same substitutions (same "
+                 "residue position and the same replacement residue), in any notation or in words "
+                 "(\"leucines 237 and 240 to alanine\" = L237A/L240A). Mutating \"the hydrophobic residues\" without "
+                 "positions, a deletion, or other positions is not a match.",
+}
+LLM_HINTS["mutations_export"] = LLM_HINTS["mutations_crm1"] = LLM_HINTS["mutations"]
 LLM_MODEL = "gemini-3.5-flash-lite"  # the model the backend uses for its own verification calls
 LLM_PROMPT = """You are checking whether an automatic extraction from a scientific paper recovered the value that \
 the curated NESdb database (nuclear export signals) records for the same protein.
@@ -350,6 +433,7 @@ def llm_judge_cells(pending, rows, row_results, mapping, args) -> dict:
         entry = row_results[i][2]
         prompt = LLM_PROMPT.format(protein=row_results[i][1].get("full_name") or row_results[i][1].get("name"),
                                    field=mapping[col].replace("_", " "), truth=entry[col][0], value=rows[i][col])
+        prompt += LLM_HINTS.get(mapping[col], "")
         jobs[(i, col)] = (hashlib.sha1(f"{args.llm_model}\n{prompt}".encode()).hexdigest(), prompt)
     todo = {key: prompt for key, prompt in jobs.values() if key not in saved}
     print(f"\nLLM judge: {len(pending)} free-text cells the rules missed, {len(todo)} new calls to {args.llm_model}")
@@ -648,12 +732,23 @@ def main():
     with (out_dir / f"{stem}_per_nes.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["NES ID", "Name", "Full Name", "CSV Rows", "Recovered", "Recovered %", "Recovered Fields", "Missed Fields"])
+        nes_rates, nes_got, nes_total = [], 0, 0
         for nes_id, nes in sorted(per_nes.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
             got = sorted(k for k, v in nes["fields"].items() if v)
             missed = sorted(k for k, v in nes["fields"].items() if v is False)
             total = len(got) + len(missed)
+            if total:
+                nes_rates.append(len(got) / total)
+                nes_got, nes_total = nes_got + len(got), nes_total + total
             w.writerow([nes_id, nes["entry"].get("name", ""), nes["entry"].get("full_name", ""), nes["rows"],
                         f"{len(got)}/{total}", f"{len(got) / total:.0%}" if total else "", "; ".join(got), "; ".join(missed)])
+        if nes_rates:
+            # Average: every NES weighs the same. Pooled: every NESdb field weighs the same.
+            mean, median = sum(nes_rates) / len(nes_rates), statistics.median(nes_rates)
+            w.writerow([])
+            w.writerow(["AVERAGE per NES", "", f"over {len(nes_rates)} NES", "", "", f"{mean:.0%}", "", ""])
+            w.writerow(["MEDIAN per NES", "", "", "", "", f"{median:.0%}", "", ""])
+            w.writerow(["POOLED (all fields)", "", "", "", f"{nes_got}/{nes_total}", f"{nes_got / nes_total:.0%}", "", ""])
 
     with (out_dir / f"{stem}_cells.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["row", "protein", "nes_id", "column", "nesdb_field", "csv_value", "nesdb_value",
@@ -665,6 +760,9 @@ def main():
     for col in mapping:
         hits, total = col_hits[col]
         print(f"  {col}: {hits}/{total}" + (f" ({hits / total:.0%})" if total else ""))
+    if nes_rates:
+        print(f"\nPer NES ({len(nes_rates)} NES): average {mean:.0%} of fields recovered, median {median:.0%}, "
+              f"pooled {nes_got}/{nes_total} ({nes_got / nes_total:.0%})")
     print(f"\n{len(per_nes)} NES IDs covered. Wrote {stem}.csv, {stem}_per_nes.csv, {stem}_cells.csv to {out_dir}")
 
 
