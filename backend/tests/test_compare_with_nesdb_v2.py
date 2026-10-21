@@ -134,3 +134,9 @@ def test_main_per_signal_and_row_classes(tmp_path):
     assert table[0]["NES Match"] == "location: 188-198 DLRDAFRTLGL"
     assert table[1]["NES Match"] == cmp.OTHER_PROTEIN
     assert table[1]["Recovered"] == ""  # not scored
+
+    with (tmp_path / "export_vs_nesdb_summary.csv").open(encoding="utf-8-sig") as f:
+        summary = {(r["Section"], r["Metric"]): r["Value"] for r in csv.DictReader(f)}
+    assert summary[("Rows", "CSV rows")] == "2"
+    assert summary[("Per NESdb signal", "location")] == "1"
+    assert summary[("Rows by NES match", cmp.OTHER_PROTEIN)] == "1"

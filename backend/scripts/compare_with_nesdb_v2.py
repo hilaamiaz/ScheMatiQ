@@ -26,6 +26,7 @@ Writes, next to the CSV (or to --out-dir):
   <name>_vs_nesdb_per_nes.csv     per NES ID: how many NESdb fields any row recovered
   <name>_vs_nesdb_per_signal.csv  per paper and NESdb signal: found by sequence / location / missed
   <name>_vs_nesdb_cells.csv       every compared cell, side by side with NESdb
+  <name>_vs_nesdb_summary.csv     the printed summary, with a note on how each number was reached
 
 NESdb pages are scraped once and cached in --cache.
 
@@ -1001,8 +1002,48 @@ def main(argv=None):
         if reasons:
             print("  Not found by sequence: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
     print(f"  {len(undetermined)} NESdb proteins cited for these papers have no mapped NES (undetermined) - not scored")
+
+    # The same summary as a table, with how each number was reached.
+    summary = [["Rows", "CSV rows", len(rows), ""],
+               ["Rows", "Matched to an NES NESdb cites the row's paper for", hows.count("cited"), ""],
+               ["Rows", "Protein in NESdb, paper not cited for it", hows.count("name only"),
+                "not scored" + (" (scored: --include-uncited)" if args.include_uncited else "")],
+               ["Rows", "Not in NESdb", hows.count(""), ""]]
+    for col in mapping:
+        hits, total = col_hits[col]
+        external = mapping[col] in EXTERNAL_FIELDS and not args.score_external
+        summary.append(["Recovered per column", col, f"{hits}/{total}" + (f" ({hits / total:.0%})" if total else ""),
+                        f"NESdb field: {mapping[col]}" + ("; from UniProt, not the paper - not in totals" if external else "")])
+    if nes_rates:
+        summary += [["Per NES", "NES IDs scored", len(nes_rates), ""],
+                    ["Per NES", "Average share of fields recovered", f"{mean:.0%}", "every NES weighs the same"],
+                    ["Per NES", "Median share of fields recovered", f"{median:.0%}", ""],
+                    ["Per NES", "Pooled fields recovered", f"{nes_got}/{nes_total} ({nes_got / nes_total:.0%})",
+                     "every NESdb field weighs the same"]]
+    match_notes = {
+        "sequence": "the row's peptide shares 8+ residues (or all of a shorter one) with this NESdb NES",
+        "location": "only the row's residue range overlaps NESdb's start-end numbers (NESdb numbers residues on its "
+                    "UniProt sequence; the residues at that range are not checked)",
+        EXTRA_NES: "the row gives an NES that is none of NESdb's for this protein - NES-specific columns not compared",
+        OTHER_PROTEIN: "the row's organism or UniProt ID contradicts NESdb's (e.g. an ortholog) - row not scored",
+        NO_NES_GIVEN: "the row has no peptide or residue range",
+        NESDB_UNDETERMINED: "NESdb has no mapped NES for this protein",
+    }
+    for kind, n in sorted(classes.items(), key=lambda kv: -kv[1]):
+        summary.append(["Rows by NES match", kind, n, match_notes.get(kind, "")])
+    summary.append(["Per NESdb signal", "Signals NESdb cites these papers for", len(signal_rows), f"{len(papers)} papers"])
+    for status, n in sorted(statuses.items(), key=lambda kv: -kv[1]):
+        summary.append(["Per NESdb signal", status, n, match_notes.get(status, "")])
+    for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        summary.append(["Not found by sequence", reason, n, "letters of the paper text, ignoring spaces and line breaks"])
+    summary.append(["Per NESdb signal", "Proteins with no mapped NES in NESdb", len(undetermined), "not scored"])
+    with (out_dir / f"{stem}_summary.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Section", "Metric", "Value", "Note"])
+        w.writerows(summary)
+
     print(f"\n{len(per_nes)} NES IDs covered. Wrote {stem}.csv, {stem}_per_nes.csv, {stem}_per_signal.csv, "
-          f"{stem}_cells.csv to {out_dir}")
+          f"{stem}_cells.csv, {stem}_summary.csv to {out_dir}")
 
 
 if __name__ == "__main__":
