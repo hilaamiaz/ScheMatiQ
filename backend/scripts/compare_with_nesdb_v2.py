@@ -13,6 +13,12 @@ Version 2 of compare_with_nesdb.py (which is kept unchanged). Differences:
   * The full protein sequence and the UniProt ID come from UniProt, not from the
     paper, so they are reported but left out of the totals (--score-external to
     count them).
+  * UniProt check: each row's NES is looked up in the protein's UniProt sequence
+    (NESdb's copy, on which NESdb numbers its NESs; fetched from UniProt only when
+    NESdb has none). A peptide is found at the row's residue numbers, elsewhere
+    (another numbering or isoform), or not at all (an ortholog, a mutant or a wrong
+    extraction); for a row with residue numbers only, the protein's residues there
+    are read and, for a location match, compared with NESdb's NES.
 
 Each CSV row is matched to an NESdb protein by its full-name column (also tried
 against NESdb's short and alternative names). Every other column is then mapped
@@ -664,6 +670,107 @@ def figure_count(docs_dir: Path | None, stem: str) -> int:
     return len(list(folder.glob("*.png"))) if folder and folder.is_dir() else 0
 
 
+# ---------------------------------------------------------------- UniProt check
+
+UNIPROT_FASTA_URL = "https://rest.uniprot.org/uniprotkb/{}.fasta"
+# Results of the UniProt check, as shown in the "UniProt Check" column.
+PEPTIDE_AT_RESIDUES = "peptide at the stated residues"
+NUMBERING_DIFFERS = "peptide elsewhere in the protein - numbering differs"
+PEPTIDE_IN_PROTEIN = "peptide in the protein"
+PEPTIDE_NOT_IN_PROTEIN = "peptide not in the protein"
+RANGE_IS_NES = "residues at the range are the NES"
+RANGE_TOO_WIDE = "range much wider than the NES"
+RANGE_SMALL_OVERLAP = "range barely overlaps the NES"
+RANGE_RESIDUES = "residues at the stated range"
+RANGE_OUTSIDE = "range beyond the protein's length"
+NO_SEQUENCE = "no UniProt sequence"
+# Results for a location-only match, best first.
+LOCATION_ORDER = [PEPTIDE_AT_RESIDUES, RANGE_IS_NES, RANGE_TOO_WIDE, RANGE_SMALL_OVERLAP, NUMBERING_DIFFERS,
+                  PEPTIDE_IN_PROTEIN, PEPTIDE_NOT_IN_PROTEIN, RANGE_RESIDUES, RANGE_OUTSIDE, NO_SEQUENCE, ""]
+
+
+def protein_sequence(entry: dict, store: dict, fetch: bool) -> str:
+    """The protein's UniProt sequence: NESdb's copy (NESdb numbers its NESs on it), else fetched from UniProt
+    by the entry's accession and kept in store. '' when there is none."""
+    seq = re.sub(r"\s+", "", entry.get("sequence") or "").upper()
+    if seq:
+        return seq
+    acc = (entry.get("uniprot") or "").strip().split("-")[0]
+    if not acc or not fetch:
+        return ""
+    if acc not in store:
+        try:
+            reply = requests.get(UNIPROT_FASTA_URL.format(acc), headers=HEADERS, timeout=30)
+            reply.raise_for_status()
+            store[acc] = "".join(reply.text.splitlines()[1:]).strip().upper()
+        except requests.RequestException as e:
+            print(f"  UniProt {acc}: {e}")
+            return ""
+    return store[acc]
+
+
+def row_peptides(values: list[str]) -> list[str]:
+    """Peptides the row states, upper case, in order."""
+    found = []
+    for v in values:
+        whole = residues(v)
+        found += [whole] if whole else PEPTIDE_RE.findall(v)
+    return list(dict.fromkeys(p.upper() for p in found if len(p) >= 5))
+
+
+def row_ranges(values: list[str]) -> list[tuple[int, int]]:
+    ranges = [(int(a), int(b)) for v in values for a, b in RANGE_RE.findall(v)]
+    return list(dict.fromkeys((a, b) for a, b in ranges if 1 <= a <= b))
+
+
+def uniprot_check(values: list[str], sequence: str, signal: dict | None = None) -> tuple[str, str]:
+    """Check the NES a row states against the protein's UniProt sequence. Returns (result, detail).
+
+    A peptide is looked up in the protein: at the row's own residue numbers, elsewhere (the paper numbers
+    residues differently, e.g. another isoform), or not at all (an ortholog, a mutant, or a wrong
+    extraction). Without a peptide, the residues at the row's range are read from the protein and, for a
+    row matched to NESdb's NES by location, compared with that NES."""
+    if not sequence:
+        return NO_SEQUENCE, ""
+    ranges = row_ranges(values)
+    for pep in row_peptides(values):
+        i = sequence.find(pep)
+        if i < 0:
+            continue
+        start, end = i + 1, i + len(pep)
+        if not ranges:
+            return PEPTIDE_IN_PROTEIN, f"{start}-{end}"
+        # Papers are often a residue or two off (e.g. counting from after the initiator Met), and a peptide
+        # may run a little past its range, so a range covering half of the peptide (or vice versa) is it.
+        def overlap(r):
+            return min(r[1], end) - max(r[0], start) + 1
+        a, b = max(ranges, key=overlap)
+        if overlap((a, b)) * 2 >= min(b - a + 1, end - start + 1):
+            return PEPTIDE_AT_RESIDUES, f"{start}-{end}" + (f" (row says {a}-{b}, offset {a - start:+d})" if a != start else "")
+        return NUMBERING_DIFFERS, f"peptide at {start}-{end}, row says {a}-{b} (offset {a - start:+d})"
+    if row_peptides(values):
+        return PEPTIDE_NOT_IN_PROTEIN, ", ".join(row_peptides(values))
+    if not ranges:
+        return "", ""
+    if signal:
+        overlapping = [(a, b) for a, b in ranges if a <= signal["end"] and b >= signal["start"]]
+        ranges = overlapping or ranges
+    a, b = ranges[0]
+    if b > len(sequence):
+        return RANGE_OUTSIDE, f"{a}-{b}, protein has {len(sequence)} residues"
+    piece = sequence[a - 1:b]
+    shown = f"{a}-{b} {piece if len(piece) <= 40 else piece[:40] + '...'}"
+    if not signal:
+        return RANGE_RESIDUES, shown
+    nes_len = signal["end"] - signal["start"] + 1
+    overlap = max(0, min(b, signal["end"]) - max(a, signal["start"]) + 1)
+    if overlap < min(8, nes_len):
+        return RANGE_SMALL_OVERLAP, f"{shown} ({overlap} of {nes_len} NES residues)"
+    if b - a + 1 > 2 * nes_len + 10:
+        return RANGE_TOO_WIDE, f"{shown} ({b - a + 1} residues for a {nes_len}-residue NES)"
+    return RANGE_IS_NES, shown
+
+
 def guess_field(header: str) -> str | None:
     h = norm(header)
     if h in EXACT_HEADERS:
@@ -717,6 +824,10 @@ def main(argv=None):
     parser.add_argument("--auto-threshold", type=float, default=0.3, help="Min agreement rate for --auto-map (default: %(default)s)")
     parser.add_argument("--docs-dir", type=Path, help="Project documents folder: check every paper in it (also those with "
                         "no rows) and whether a missed NES is written in the paper text")
+    parser.add_argument("--uniprot-cache", type=Path, default=DEFAULT_CACHE.with_name("uniprot_sequences.json"),
+                        help="Protein sequences fetched from UniProt when NESdb has none (default: %(default)s)")
+    parser.add_argument("--no-uniprot-fetch", action="store_true",
+                        help="Check only against the sequences NESdb already has; never call UniProt")
     parser.add_argument("--score-external", action="store_true",
                         help="Also count fields NESdb takes from UniProt (full sequence, UniProt ID) in the totals")
     args = parser.parse_args(argv)
@@ -787,8 +898,14 @@ def main(argv=None):
     # Score every cell. A row matching several NES IDs is scored against the one whose NES it gives,
     # then the one it recovers most of. A row about another species or protein is not scored, and
     # for a row giving an NES that NESdb doesn't list, the NES-specific columns are not compared.
-    cells, row_results, row_class = [], [], []
+    cells, row_results, row_class, row_uniprot = [], [], [], []
     signal_rank = {"sequence": 2, "location": 1}
+    uniprot_store = json.loads(args.uniprot_cache.read_text(encoding="utf-8")) if args.uniprot_cache.exists() else {}
+    uniprot_known = len(uniprot_store)
+
+    def sequence_of(entry: dict) -> str:
+        return protein_sequence(entry, uniprot_store, fetch=not args.no_uniprot_fetch)
+
     for i, (row, cands) in enumerate(zip(rows, matches)):
         best = None
         for entry in cands:
@@ -798,6 +915,7 @@ def main(argv=None):
             if best is None or score > best[0]:
                 best = (score, entry, res)
         cls = classify_row(row, best[1], mapping, args) if best else (None, None)
+        row_uniprot.append(uniprot_check(signal_values(row, mapping), sequence_of(best[1]), cls[1]) if best else ("", ""))
         if cls[0] == OTHER_PROTEIN:
             best = None
         elif cls[0] == EXTRA_NES:
@@ -838,7 +956,8 @@ def main(argv=None):
     out_dir = args.out_dir or args.csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = args.csv.stem + "_vs_nesdb"
-    extra = ["NESdb ID", "NESdb Full Name", "Match", "Name Match", "NES Match", "Recovered", "Recovered %"]
+    extra = ["NESdb ID", "NESdb Full Name", "Match", "Name Match", "NES Match", "UniProt Check", "UniProt Detail",
+             "Recovered", "Recovered %"]
 
     def nes_match_text(cls) -> str:
         kind, s = cls
@@ -850,7 +969,7 @@ def main(argv=None):
     with (out_dir / f"{stem}.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(columns + extra)
-        for row, best, (cands, score, how), cls in zip(rows, row_results, found, row_class):
+        for row, best, (cands, score, how), cls, check in zip(rows, row_results, found, row_class, row_uniprot):
             if not best:
                 ids = ", ".join(e["nes_id"] for e in cands)
                 names = ", ".join(dict.fromkeys(e.get("full_name") or e.get("name", "") for e in cands)) or "not in NESdb"
@@ -858,7 +977,7 @@ def main(argv=None):
                     note = "other species/protein - not scored"
                 else:
                     note = "name only - paper not cited for it, not scored" if how else "not in NESdb"
-                w.writerow([row[c] for c in columns] + [ids, names, note, f"{score:.2f}", nes_match_text(cls), "", ""])
+                w.writerow([row[c] for c in columns] + [ids, names, note, f"{score:.2f}", nes_match_text(cls), *check, "", ""])
                 continue
             _, entry, res = best
             judged = [r for col, (_, r) in res.items() if r in (True, False) and counted(col, row[col])]
@@ -868,7 +987,7 @@ def main(argv=None):
                     col_hits[col][1] += 1
             pct = f"{sum(judged) / len(judged):.0%}" if judged else ""
             w.writerow([row[c] for c in columns] + [
-                entry["nes_id"], entry.get("full_name", ""), how, f"{score:.2f}", nes_match_text(cls),
+                entry["nes_id"], entry.get("full_name", ""), how, f"{score:.2f}", nes_match_text(cls), *check,
                 f"{sum(judged)}/{len(judged)}", pct])
         external_cols = {c for c in mapping if mapping[c] in EXTERNAL_FIELDS and not args.score_external}
         all_hits = sum(h for c, (h, _) in col_hits.items() if c not in external_cols)
@@ -882,7 +1001,7 @@ def main(argv=None):
         total = f"{all_hits}/{all_total} ({all_hits / all_total:.0%})" if all_total else ""
         w.writerow([])
         w.writerow(field_row)
-        w.writerow(recovered_row + ["", "", "", "", "", total, ""])
+        w.writerow(recovered_row + ["", "", "", "", "", "", "", total, ""])
 
     # Per NES: a field counts as recovered if any row of that NES recovered it.
     per_nes = defaultdict(lambda: {"rows": 0, "fields": defaultdict(lambda: None), "entry": None})
@@ -947,14 +1066,20 @@ def main(argv=None):
                 continue
             own = [i for i in rows_by_pmid[pmid] if any(e is entry for e in found[i][0])]
             for s in signals:
-                status, by_rows = "missed", []
+                status, by_rows, location_checks = "missed", [], []
                 for i in own:
-                    hits = {signal_hit(v, s) for v in signal_values(rows[i], mapping)}
+                    values = signal_values(rows[i], mapping)
+                    hits = {signal_hit(v, s) for v in values}
                     hit = "sequence" if "sequence" in hits else "location" if "location" in hits else None
                     if hit:
                         by_rows.append(str(i + 1))
                         if status != "sequence":
                             status = hit
+                        if hit == "location":
+                            location_checks.append(uniprot_check(values, sequence_of(entry), s)[0])
+                # For a location-only match: the best UniProt result among the rows that gave it.
+                location_check = min(location_checks, key=LOCATION_ORDER.index, default="") \
+                    if status == "location" else ""
                 if not own:
                     status = "missed - no row for this protein" if rows_by_pmid[pmid] else "missed - paper has no rows"
                 reason = ""
@@ -967,14 +1092,18 @@ def main(argv=None):
                         reason = f"peptide not in the paper text ({figures} extracted figures)" if figures \
                             else "peptide not in the paper text, no extracted figures"
                 signal_rows.append([doc, pmid, entry["nes_id"], entry.get("name", ""), signal_text(s), status,
-                                    ", ".join(by_rows), reason])
+                                    ", ".join(by_rows), reason, location_check])
     with (out_dir / f"{stem}_per_signal.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["Document", "PMID", "NES ID", "Name", "NESdb Signal", "Status", "CSV Rows", "Why not by sequence"])
+        w.writerow(["Document", "PMID", "NES ID", "Name", "NESdb Signal", "Status", "CSV Rows", "Why not by sequence",
+                    "UniProt Check (location matches)"])
         w.writerows(signal_rows)
         for doc, entry in undetermined:
             w.writerow([doc, SOURCE_RE.match(doc).group(2), entry["nes_id"], entry.get("name", ""),
-                        "undetermined in NESdb", "not scored", "", ""])
+                        "undetermined in NESdb", "not scored", "", "", ""])
+    if len(uniprot_store) > uniprot_known:
+        args.uniprot_cache.parent.mkdir(parents=True, exist_ok=True)
+        args.uniprot_cache.write_text(json.dumps(uniprot_store, indent=1), encoding="utf-8")
 
     print("\nRecovered per column")
     for col in mapping:
@@ -1002,6 +1131,18 @@ def main(argv=None):
         if reasons:
             print("  Not found by sequence: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
     print(f"  {len(undetermined)} NESdb proteins cited for these papers have no mapped NES (undetermined) - not scored")
+    row_checks = defaultdict(int)
+    for check, _ in row_uniprot:
+        if check:
+            row_checks[check] += 1
+    location_quality = defaultdict(int)
+    for r in signal_rows:
+        if r[8]:
+            location_quality[r[8]] += 1
+    print("\nUniProt check per row: " + ", ".join(f"{k} {v}" for k, v in sorted(row_checks.items(), key=lambda kv: -kv[1])))
+    if location_quality:
+        print("  Signals found by location only: "
+              + ", ".join(f"{k} {v}" for k, v in sorted(location_quality.items(), key=lambda kv: -kv[1])))
 
     # The same summary as a table, with how each number was reached.
     summary = [["Rows", "CSV rows", len(rows), ""],
@@ -1023,7 +1164,7 @@ def main(argv=None):
     match_notes = {
         "sequence": "the row's peptide shares 8+ residues (or all of a shorter one) with this NESdb NES",
         "location": "only the row's residue range overlaps NESdb's start-end numbers (NESdb numbers residues on its "
-                    "UniProt sequence; the residues at that range are not checked)",
+                    "UniProt sequence) - see the UniProt check for what the protein has at that range",
         EXTRA_NES: "the row gives an NES that is none of NESdb's for this protein - NES-specific columns not compared",
         OTHER_PROTEIN: "the row's organism or UniProt ID contradicts NESdb's (e.g. an ortholog) - row not scored",
         NO_NES_GIVEN: "the row has no peptide or residue range",
@@ -1037,6 +1178,22 @@ def main(argv=None):
     for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
         summary.append(["Not found by sequence", reason, n, "letters of the paper text, ignoring spaces and line breaks"])
     summary.append(["Per NESdb signal", "Proteins with no mapped NES in NESdb", len(undetermined), "not scored"])
+    check_notes = {
+        PEPTIDE_AT_RESIDUES: "the row's peptide is in the protein at the residue numbers the row gives",
+        NUMBERING_DIFFERS: "the row's peptide is in the protein but at other numbers (another isoform or numbering)",
+        PEPTIDE_IN_PROTEIN: "the row's peptide is in the protein; the row gives no residue numbers",
+        PEPTIDE_NOT_IN_PROTEIN: "the row's peptide is not in NESdb's protein: an ortholog, a mutant or a wrong extraction",
+        RANGE_IS_NES: "no peptide; the protein's residues at the row's range are NESdb's NES",
+        RANGE_TOO_WIDE: "no peptide; the range holds NESdb's NES but is more than twice as long",
+        RANGE_SMALL_OVERLAP: "no peptide; the range shares fewer than 8 residues with NESdb's NES",
+        RANGE_RESIDUES: "no peptide; the protein's residues at the row's range (an NES NESdb doesn't list)",
+        RANGE_OUTSIDE: "the row's range goes past the end of NESdb's protein: numbering of another protein",
+        NO_SEQUENCE: "neither NESdb nor UniProt gave a sequence",
+    }
+    for check, n in sorted(row_checks.items(), key=lambda kv: -kv[1]):
+        summary.append(["UniProt check per row", check, n, check_notes.get(check, "")])
+    for check, n in sorted(location_quality.items(), key=lambda kv: -kv[1]):
+        summary.append(["UniProt check of signals found by location only", check, n, check_notes.get(check, "")])
     with (out_dir / f"{stem}_summary.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["Section", "Metric", "Value", "Note"])

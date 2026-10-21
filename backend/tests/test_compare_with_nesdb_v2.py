@@ -99,6 +99,43 @@ def test_is_external():
     assert not cmp.is_external("organism", "Human")
 
 
+# A made-up 40-residue protein whose NES (DLRDAFRTLGL) sits at 21-31.
+PROTEIN = "MSTNPKQAGEHYVRWCFILP" + "DLRDAFRTLGL" + "SEKQNAGHYV"
+NES = {"start": 21, "seq": "DLRDAFRTLGL", "end": 31}
+
+
+@pytest.mark.parametrize("values, expected", [
+    (["DLRDAFRTLGL", "21-31"], cmp.PEPTIDE_AT_RESIDUES),
+    (["DLRDAFRTLGL", "22-32"], cmp.PEPTIDE_AT_RESIDUES),       # one residue off: same NES
+    (["DLRDAFRTLGL", "101-111"], cmp.NUMBERING_DIFFERS),       # another isoform's numbering
+    (["DLRDAFRTLGL"], cmp.PEPTIDE_IN_PROTEIN),
+    (["LRDAFKTLGL", "21-30"], cmp.PEPTIDE_NOT_IN_PROTEIN),     # ortholog / mutant
+    (["35-80"], cmp.RANGE_OUTSIDE),
+])
+def test_uniprot_check_of_a_row(values, expected):
+    assert cmp.uniprot_check(values, PROTEIN)[0] == expected
+
+
+@pytest.mark.parametrize("values, expected", [
+    (["amino acids 21-31"], cmp.RANGE_IS_NES),
+    (["1-40"], cmp.RANGE_TOO_WIDE),
+    (["29-35"], cmp.RANGE_SMALL_OVERLAP),
+])
+def test_uniprot_check_of_a_location_match(values, expected):
+    assert cmp.uniprot_check(values, PROTEIN, NES)[0] == expected
+
+
+def test_uniprot_check_reads_the_residues_at_an_unmatched_range():
+    assert cmp.uniprot_check(["1-5"], PROTEIN) == (cmp.RANGE_RESIDUES, "1-5 MSTNP")
+
+
+def test_protein_sequence_prefers_nesdb_and_does_not_fetch_without_need():
+    store = {}
+    assert cmp.protein_sequence({"sequence": "mstnp\nkq", "uniprot": "Q9GZX7"}, store, fetch=True) == "MSTNPKQ"
+    assert cmp.protein_sequence({"sequence": "", "uniprot": "Q9GZX7"}, store, fetch=False) == ""
+    assert store == {}
+
+
 def _write_csv(path, rows):
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -121,7 +158,7 @@ def test_main_per_signal_and_row_classes(tmp_path):
         dict(base, Organism="Chicken", **{"Nes Peptide Sequence": "LRDAFKTLGL"}),  # ortholog
     ])
     cmp.main([str(tmp_path / "export.csv"), "--cache", str(cache), "--out-dir", str(tmp_path),
-              "--docs-dir", str(docs)])
+              "--docs-dir", str(docs), "--uniprot-cache", str(tmp_path / "uniprot.json"), "--no-uniprot-fetch"])
 
     with (tmp_path / "export_vs_nesdb_per_signal.csv").open(encoding="utf-8-sig") as f:
         signals = list(csv.DictReader(f))
